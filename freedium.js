@@ -9,7 +9,7 @@
 // @run-at       document-idle
 // @noframes
 // @grant        none
-// @icon https://avatars.githubusercontent.com/u/142643505?s=200&v=4
+// @icon         https://avatars.githubusercontent.com/u/142643505?s=200&v=4
 // ==/UserScript==
 
 (function () {
