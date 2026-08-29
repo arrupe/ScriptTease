@@ -1,1 +1,209 @@
-/.vscode
+# ==============================================================================
+# 1. DEPENDENCIES & PACKAGE MANAGERS
+# ==============================================================================
+
+node_modules/
+jspm_packages/
+bower_components/
+
+# Yarn Plug'n'Play
+.pnp/
+.pnp.js
+
+
+# ==============================================================================
+# 2. OPERATING SYSTEM FILES
+# ==============================================================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.Trashes
+VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.lnk
+*.msi
+*.msm
+*.msp
+*.sys
+*.tmp
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+
+# ==============================================================================
+# 3. IDEs & EDITORS
+# ==============================================================================
+
+# Visual Studio Code
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/tasks.json
+
+.history/
+*.code-workspace
+
+# JetBrains
+.idea/
+*.iws
+*.iml
+*.ipr
+
+# Visual Studio
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Xcode
+.build/
+DerivedData/
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+!*.xcodeproj/xcshareddata/
+!*.xcodeproj/xcshareddata/**
+
+# Vim / Emacs
+*.sw?
+.netrwhist
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+elc/
+auto-save-list/
+tramp
+.\#*
+
+
+# ==============================================================================
+# 4. BUILD, OUTPUT & CACHE DIRECTORIES
+# ==============================================================================
+
+dist/
+build/
+out/
+bin/
+obj/
+
+.next/
+.nuxt/
+.docusaurus/
+
+.cache/
+.sass-cache/
+
+
+# ==============================================================================
+# 5. ENVIRONMENT FILES, CREDENTIALS & SECRETS
+# ==============================================================================
+
+# Environment files
+.env
+.env.*
+*.env
+
+# Allow safe environment templates
+!.env.example
+!.env.template
+!.env.sample
+
+# Keys and certificates
+*.pem
+*.key
+*.cert
+*.crt
+*.pfx
+*.p12
+
+# Credentials and secrets
+.credentials.json
+credentials.json
+secrets.*
+*.secret
+
+
+# ==============================================================================
+# 6. LOGS & DIAGNOSTICS
+# ==============================================================================
+
+*.log
+logs/
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+*.gz
+
+
+# ==============================================================================
+# 7. TESTING & CODE QUALITY
+# ==============================================================================
+
+# Coverage
+coverage/
+.nyc_output/
+*.lcov
+
+# Test results
+test-results/
+playwright-report/
+cypress/videos/
+cypress/screenshots/
+
+# Tool caches
+.eslintcache
+.stylelintcache
+.prettiercache
+*.tsbuildinfo
+
+
+# ==============================================================================
+# 8. LANGUAGE & RUNTIME FILES
+# ==============================================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+.venv/
+venv/
+ENV/
+env/
+
+
+# ==============================================================================
+# 9. DOCKER
+# ==============================================================================
+
+.docker/
+Docker-data/
