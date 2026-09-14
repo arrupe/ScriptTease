@@ -9,7 +9,7 @@
 // @include      *://ipv4.google.*/sorry/*
 // @run-at       document-start
 // @grant        unsafeWindow
-// @icon         https://avatars.githubusercontent.com/u/142643505?s=200&v=4
+// @icon         https://images.icon-icons.com/2699/PNG/512/google_recaptcha_logo_icon_170062.png
 // ==/UserScript==
 
 (function () {

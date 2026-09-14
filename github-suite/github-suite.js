@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GitHub Suite
 // @namespace    https://github.com/arrupe
-// @version      1.6.1
+// @version      1.7.0
 // @description  Combines a GitHub folder download menu, file-type colors/icons, image preview galleries, a HTML preview button, a wiki sidebar toggle, a one-click recursive git clone command copier, a DeepWiki entry in the repo About sidebar, and hides "Report repository".
 // @author       arrupe
 // @license      WTFPL
@@ -50,11 +50,40 @@
         cssBuffer.length = 0;
     }
 
+    /*
+     * Current repository as "owner/name", or null off repo pages. GitHub
+     * exposes it in page metadata; the URL is the fallback.
+     */
+    const RESERVED_OWNERS = new Set([
+        'settings',
+        'marketplace',
+        'notifications',
+        'organizations',
+        'orgs',
+        'users',
+        'topics',
+        'collections',
+        'events',
+        'sponsors',
+        'search',
+    ]);
+    function getRepositoryName() {
+        const meta = $('meta[name="octolytics-dimension-repository_nwo"]');
+        if (meta?.content?.includes('/')) return meta.content;
+        const match = location.pathname.match(/^\/([^/]+)\/([^/]+)(?:\/|$)/);
+        if (!match || RESERVED_OWNERS.has(match[1].toLowerCase())) return null;
+        return `${match[1]}/${match[2]}`;
+    }
+
     const syncFns = [];
     const registerSync = (fn) => syncFns.push(fn);
     function runSyncs() {
         for (const fn of syncFns) {
-            try { fn(); } catch (e) { console.warn('[GitHub Suite]', e); }
+            try {
+                fn();
+            } catch (e) {
+                console.warn('[GitHub Suite]', e);
+            }
         }
     }
 
@@ -66,64 +95,57 @@
     // ===============================================================
 
     (function moduleRepoEnhancer() {
+        // =========================================================================
+        // Configuration
+        // =========================================================================
 
+        const COLORS_URL =
+            'https://raw.githubusercontent.com/ChinaGodMan/UserScripts/main/' +
+            'github-file-list-beautifier-plus/colors.json';
 
-    // =========================================================================
-    // Configuration
-    // =========================================================================
+        const COLORS_STORAGE_KEY = 'fileTypesColors';
+        const COLORS_FETCHED_KEY = 'fileTypesColorsFetchedAt';
+        const COLORS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // refresh the remote palette weekly
 
-    const COLORS_URL =
-        'https://raw.githubusercontent.com/ChinaGodMan/UserScripts/main/' +
-        'github-file-list-beautifier-plus/colors.json';
+        const PROCESSED_ATTR = 'data-github-enhancer-processed';
+        const FILE_TYPE_ATTR = 'data-github-enhancer-file-type';
 
-    const COLORS_STORAGE_KEY = 'fileTypesColors';
-    const COLORS_FETCHED_KEY = 'fileTypesColorsFetchedAt';
-    const COLORS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // refresh the remote palette weekly
+        const DEFAULT_CONFIG = {
+            iconSize: 24,
+            colorSeed1: 13,
+            colorSeed2: 1299721,
+            colorSeed3: 179426453,
+        };
 
-    const PROCESSED_ATTR = 'data-github-enhancer-processed';
-    const FILE_TYPE_ATTR = 'data-github-enhancer-file-type';
+        // Extensions that get an inline thumbnail (raw.githubusercontent.com
+        // serves SVG as image/svg+xml, so it renders in an <img> like the rest).
+        const IMAGE_EXTENSIONS = /^(png|jpe?g|bmp|gif|webp|avif|cur|ico|svg)$/i;
 
-    const DEFAULT_CONFIG = {
-        iconSize: 24,
-        colorSeed1: 13,
-        colorSeed2: 1299721,
-        colorSeed3: 179426453
-    };
+        const state = {
+            customColors: {},
+            generatedColors: new Map(),
+            theme: null, // resolved once per sync pass, see beautifyFileList()
+        };
 
-    /*
-     * Extensions that get an inline thumbnail. SVG is deliberately absent:
-     * GitHub serves raw SVGs as text/plain with X-Content-Type-Options:
-     * nosniff, so an <img src> pointing at them never renders. (Module 2
-     * handles SVG previews by fetching and inlining them.)
-     */
-    const IMAGE_EXTENSIONS =
-        /^(png|jpe?g|bmp|gif|webp|avif|cur|ico)$/i;
+        let cachedConfig = null;
 
-    const state = {
-        customColors: {},
-        generatedColors: new Map(),
-        theme: null // resolved once per sync pass, see beautifyFileList()
-    };
+        // =========================================================================
+        // Initialization
+        // =========================================================================
 
-    let cachedConfig = null;
+        function initialize() {
+            loadStoredColors();
+            addStyles();
+            loadRemoteColorsIfNeeded();
+            // The suite's shared observer drives every sync pass for this module.
+        }
 
-    // =========================================================================
-    // Initialization
-    // =========================================================================
+        // =========================================================================
+        // Styles
+        // =========================================================================
 
-    function initialize() {
-        loadStoredColors();
-        addStyles();
-        loadRemoteColorsIfNeeded();
-        // The suite's shared observer drives every sync pass for this module.
-    }
-
-    // =========================================================================
-    // Styles
-    // =========================================================================
-
-    function addStyles() {
-        addStyle(`
+        function addStyles() {
+            addStyle(`
             .github-enhancer-file-icon {
                 width: 16px !important;
                 height: 16px !important;
@@ -145,861 +167,540 @@
                 font-weight: 600 !important;
             }
         `);
-    }
+        }
 
-    // =========================================================================
-    // Saved Configuration
-    // =========================================================================
+        // =========================================================================
+        // Saved Configuration
+        // =========================================================================
 
-    function getConfig() {
-        if (cachedConfig) {
+        function getConfig() {
+            if (cachedConfig) {
+                return cachedConfig;
+            }
+
+            let saved = {};
+
+            try {
+                saved = JSON.parse(localStorage.getItem('FileListBeautifier') || '{}');
+            } catch {
+                saved = {};
+            }
+
+            cachedConfig = {
+                iconSize: getNumber(saved.iconSize, DEFAULT_CONFIG.iconSize),
+
+                colorSeed1: getNumber(saved.colorSeed1, DEFAULT_CONFIG.colorSeed1),
+
+                colorSeed2: getNumber(saved.colorSeed2, DEFAULT_CONFIG.colorSeed2),
+
+                colorSeed3: getNumber(saved.colorSeed3, DEFAULT_CONFIG.colorSeed3),
+            };
+
             return cachedConfig;
         }
 
-        let saved = {};
+        function getNumber(value, fallback) {
+            const number = Number(value);
 
-        try {
-            saved = JSON.parse(
-                localStorage.getItem('FileListBeautifier') || '{}'
-            );
-        } catch {
-            saved = {};
+            return Number.isFinite(number) && number > 0 ? number : fallback;
         }
 
-        cachedConfig = {
-            iconSize:
-                getNumber(
-                    saved.iconSize,
-                    DEFAULT_CONFIG.iconSize
-                ),
+        // =========================================================================
+        // File Color Configuration
+        // =========================================================================
 
-            colorSeed1:
-                getNumber(
-                    saved.colorSeed1,
-                    DEFAULT_CONFIG.colorSeed1
-                ),
+        function loadStoredColors() {
+            try {
+                const colors = GM_getValue(COLORS_STORAGE_KEY, {}) || {};
 
-            colorSeed2:
-                getNumber(
-                    saved.colorSeed2,
-                    DEFAULT_CONFIG.colorSeed2
-                ),
-
-            colorSeed3:
-                getNumber(
-                    saved.colorSeed3,
-                    DEFAULT_CONFIG.colorSeed3
-                )
-        };
-
-        return cachedConfig;
-    }
-
-    function getNumber(value, fallback) {
-        const number = Number(value);
-
-        return Number.isFinite(number) && number > 0
-            ? number
-            : fallback;
-    }
-
-    // =========================================================================
-    // File Color Configuration
-    // =========================================================================
-
-    function loadStoredColors() {
-        try {
-            const colors =
-                GM_getValue(COLORS_STORAGE_KEY, {}) || {};
-
-            if (
-                colors &&
-                typeof colors === 'object'
-            ) {
-                state.customColors = colors;
+                if (colors && typeof colors === 'object') {
+                    state.customColors = colors;
+                }
+            } catch {
+                state.customColors = {};
             }
-        } catch {
-            state.customColors = {};
-        }
-    }
-
-    async function loadRemoteColorsIfNeeded() {
-        const haveColors = Object.keys(state.customColors).length > 0;
-
-        let fetchedAt = 0;
-        try {
-            fetchedAt = Number(GM_getValue(COLORS_FETCHED_KEY, 0)) || 0;
-        } catch {
-            // Storage is optional.
         }
 
-        if (haveColors && Date.now() - fetchedAt < COLORS_TTL_MS) {
-            return;
-        }
+        async function loadRemoteColorsIfNeeded() {
+            const haveColors = Object.keys(state.customColors).length > 0;
 
-        try {
-            const colors =
-                await requestJson(COLORS_URL);
+            let fetchedAt = 0;
+            try {
+                fetchedAt = Number(GM_getValue(COLORS_FETCHED_KEY, 0)) || 0;
+            } catch {
+                // Storage is optional.
+            }
 
-            if (
-                !colors ||
-                typeof colors !== 'object'
-            ) {
+            if (haveColors && Date.now() - fetchedAt < COLORS_TTL_MS) {
                 return;
             }
 
-            const changed =
-                JSON.stringify(colors) !== JSON.stringify(state.customColors);
+            try {
+                const colors = await requestJson(COLORS_URL);
 
-            state.customColors = colors;
+                if (!colors || typeof colors !== 'object') {
+                    return;
+                }
+
+                const changed = JSON.stringify(colors) !== JSON.stringify(state.customColors);
+
+                state.customColors = colors;
+
+                try {
+                    GM_setValue(COLORS_STORAGE_KEY, colors);
+                    GM_setValue(COLORS_FETCHED_KEY, Date.now());
+                } catch {
+                    // Local caching is optional.
+                }
+
+                /*
+                 * Existing files may have been processed before the color
+                 * configuration finished loading (or with an older palette).
+                 * Reset them so they can be processed again.
+                 */
+                if (changed) {
+                    state.generatedColors.clear();
+                    resetProcessedFiles();
+                    beautifyFileList();
+                }
+            } catch (error) {
+                console.warn(
+                    '[GitHub Repository Enhancer] ' + 'Unable to load file color configuration.',
+                    error
+                );
+            }
+        }
+
+        function requestJson(url) {
+            return new Promise((resolve, reject) => {
+                if (typeof GM_xmlhttpRequest === 'function') {
+                    GM_xmlhttpRequest({
+                        method: 'GET',
+                        url,
+
+                        onload(response) {
+                            if (response.status < 200 || response.status >= 300) {
+                                reject(new Error(`Request failed: ${response.status}`));
+
+                                return;
+                            }
+
+                            try {
+                                resolve(JSON.parse(response.responseText));
+                            } catch (error) {
+                                reject(error);
+                            }
+                        },
+
+                        onerror() {
+                            reject(new Error('Network request failed.'));
+                        },
+                    });
+
+                    return;
+                }
+
+                fetch(url)
+                    .then((response) => {
+                        if (!response.ok) {
+                            throw new Error(`Request failed: ${response.status}`);
+                        }
+
+                        return response.json();
+                    })
+                    .then(resolve)
+                    .catch(reject);
+            });
+        }
+
+        // =========================================================================
+        // File List Beautifier
+        // =========================================================================
+
+        function beautifyFileList() {
+            state.theme = isDarkTheme() ? 'dark' : 'light';
+
+            const selectors = [
+                '.react-directory-truncate',
+                'a.js-navigation-open',
+
+                'table a[href*="/blob/"]',
+                'table a[href*="/tree/"]',
+            ];
+
+            const elements = document.querySelectorAll(selectors.join(','));
+
+            for (const element of elements) {
+                processFileElement(element);
+            }
+        }
+
+        function processFileElement(element) {
+            const link = element.matches('a') ? element : element.querySelector('a[href]');
+
+            if (!link) {
+                return;
+            }
+
+            if (link.hasAttribute(PROCESSED_ATTR)) {
+                return;
+            }
+
+            const href = link.href;
+
+            if (!href) {
+                return;
+            }
+
+            let url;
 
             try {
-                GM_setValue(COLORS_STORAGE_KEY, colors);
-                GM_setValue(COLORS_FETCHED_KEY, Date.now());
+                url = new URL(href);
             } catch {
-                // Local caching is optional.
+                return;
+            }
+
+            if (url.hostname !== 'github.com') {
+                return;
+            }
+
+            // ---------------------------------------------------------------------
+            // Folder
+            // ---------------------------------------------------------------------
+
+            if (url.pathname.includes('/tree/')) {
+                link.setAttribute(FILE_TYPE_ATTR, 'folder');
+
+                link.setAttribute(PROCESSED_ATTR, 'true');
+
+                return;
+            }
+
+            // ---------------------------------------------------------------------
+            // File
+            // ---------------------------------------------------------------------
+
+            if (!url.pathname.includes('/blob/')) {
+                return;
+            }
+
+            const filename = getFilename(url);
+
+            if (!filename) {
+                return;
+            }
+
+            let type = getFileType(filename);
+
+            if (state.customColors[filename]) {
+                type = filename;
+            }
+
+            link.setAttribute(FILE_TYPE_ATTR, type);
+
+            applyFileColor(link, type);
+
+            const icon = findFileIcon(link);
+
+            if (icon) {
+                replaceFileIcon(icon, url, filename, type);
+            }
+
+            link.setAttribute(PROCESSED_ATTR, 'true');
+        }
+
+        function resetProcessedFiles() {
+            document.querySelectorAll(`[${PROCESSED_ATTR}]`).forEach((element) => {
+                element.removeAttribute(PROCESSED_ATTR);
+            });
+        }
+
+        // =========================================================================
+        // File Information
+        // =========================================================================
+
+        function getFilename(url) {
+            try {
+                return decodeURIComponent(url.pathname.split('/').pop() || '').toLowerCase();
+            } catch {
+                return '';
+            }
+        }
+
+        function getFileType(filename) {
+            const match = filename.match(/\.([^.]+)$/);
+
+            if (!match) {
+                return filename.toLowerCase();
+            }
+
+            return match[1].toLowerCase();
+        }
+
+        // =========================================================================
+        // File Colors
+        // =========================================================================
+
+        function applyFileColor(link, type) {
+            const color = getColorForType(type);
+
+            if (!color) {
+                return;
+            }
+
+            link.style.setProperty('color', color, 'important');
+        }
+
+        function getColorForType(type) {
+            const custom = state.customColors[type];
+
+            /*
+             * Support either:
+             *
+             * {
+             *   "js": {
+             *      "color": "#..."
+             *   }
+             * }
+             *
+             * or a simple string.
+             */
+            if (typeof custom === 'string') {
+                return custom;
+            }
+
+            if (custom && typeof custom === 'object' && custom.color) {
+                return custom.color;
+            }
+
+            const theme = state.theme || (isDarkTheme() ? 'dark' : 'light');
+
+            const cacheKey = `${theme}:${type}`;
+
+            if (state.generatedColors.has(cacheKey)) {
+                return state.generatedColors.get(cacheKey);
+            }
+
+            const config = getConfig();
+
+            const hash = calculateHash(type, config.colorSeed1);
+
+            const hue = hash % 360;
+
+            const hueSection = hue / 60;
+
+            const saturation = ((hash * config.colorSeed2) % 50) + 50;
+
+            const redFix = hueSection < 1 ? 1 - hueSection : hueSection > 4 ? (hueSection - 4) / 2 : 0;
+
+            const blueFix =
+                (hueSection < 3 || hueSection > 5 ? 0 : hueSection < 4 ? hueSection - 3 : 5 - hueSection) * 3;
+
+            const [lumaBias, lumaAmp, lumaFix] = theme === 'dark' ? [30, 50, 12] : [25, 15, 0];
+
+            const lightness = Math.floor(
+                ((hash * config.colorSeed3) % lumaAmp) +
+                    lumaBias +
+                    ((redFix + blueFix) * lumaFix * saturation) / 100
+            );
+
+            const color = `hsl(${hue} ${Math.floor(saturation)}% ${lightness}%)`;
+
+            state.generatedColors.set(cacheKey, color);
+
+            return color;
+        }
+
+        function calculateHash(text, seed) {
+            let hash = 0;
+
+            for (let i = 0; i < text.length; i++) {
+                hash = (hash << 5) - hash + text.charCodeAt(i);
+
+                hash |= 0;
+            }
+
+            return Math.abs(Math.imul(hash, seed));
+        }
+
+        function isDarkTheme() {
+            const root = document.documentElement;
+
+            if (root.dataset.colorMode === 'dark') {
+                return true;
+            }
+
+            if (root.dataset.colorMode === 'light') {
+                return false;
+            }
+
+            if (root.dataset.darkTheme && !root.dataset.lightTheme) {
+                return true;
+            }
+
+            if (!document.body) {
+                return false;
+            }
+
+            const background = getComputedStyle(document.body).backgroundColor;
+
+            const values = background.match(/[\d.]+/g)?.map(Number);
+
+            if (!values || values.length < 3) {
+                return false;
+            }
+
+            const [red, green, blue] = values;
+
+            const luminance = red * 0.2126 + green * 0.7152 + blue * 0.0722;
+
+            return luminance < 128;
+        }
+
+        // =========================================================================
+        // File Icons
+        // =========================================================================
+
+        function findFileIcon(link) {
+            const row = link.closest(['tr', '[role="row"]', '.js-navigation-item', '.Box-row'].join(','));
+
+            if (!row) {
+                return null;
+            }
+
+            return (
+                row.querySelector(
+                    [
+                        'svg.octicon-file',
+                        'svg.octicon-file-directory-fill',
+                        'svg.icon-file',
+                        'svg.icon-directory',
+                        'svg.octicon',
+                    ].join(',')
+                ) || null
+            );
+        }
+
+        function replaceFileIcon(icon, url, filename, type) {
+            const customIcon = getCustomIcon(filename, type);
+
+            if (customIcon) {
+                const iconUrl = resolveCustomIconUrl(customIcon);
+
+                if (iconUrl) {
+                    icon.replaceWith(
+                        createImage({
+                            className: 'github-enhancer-file-icon',
+
+                            src: iconUrl,
+
+                            title: `${type.toUpperCase()} file`,
+                        })
+                    );
+
+                    return;
+                }
             }
 
             /*
-             * Existing files may have been processed before the color
-             * configuration finished loading (or with an older palette).
-             * Reset them so they can be processed again.
+             * Display an actual image thumbnail when the repository item
+             * itself is an image.
              */
-            if (changed) {
-                state.generatedColors.clear();
-                resetProcessedFiles();
-                beautifyFileList();
-            }
-
-        } catch (error) {
-            console.warn(
-                '[GitHub Repository Enhancer] ' +
-                'Unable to load file color configuration.',
-                error
-            );
-        }
-    }
-
-    function requestJson(url) {
-        return new Promise((resolve, reject) => {
-            if (
-                typeof GM_xmlhttpRequest ===
-                'function'
-            ) {
-                GM_xmlhttpRequest({
-                    method: 'GET',
-                    url,
-
-                    onload(response) {
-                        if (
-                            response.status < 200 ||
-                            response.status >= 300
-                        ) {
-                            reject(
-                                new Error(
-                                    `Request failed: ${response.status}`
-                                )
-                            );
-
-                            return;
-                        }
-
-                        try {
-                            resolve(
-                                JSON.parse(
-                                    response.responseText
-                                )
-                            );
-                        } catch (error) {
-                            reject(error);
-                        }
-                    },
-
-                    onerror() {
-                        reject(
-                            new Error(
-                                'Network request failed.'
-                            )
-                        );
-                    }
-                });
-
+            if (!IMAGE_EXTENSIONS.test(type)) {
                 return;
             }
 
-            fetch(url)
-                .then(response => {
-                    if (!response.ok) {
-                        throw new Error(
-                            `Request failed: ${response.status}`
-                        );
-                    }
+            const rawUrl = getRawGitHubUrl(url);
 
-                    return response.json();
+            if (!rawUrl) {
+                return;
+            }
+
+            icon.replaceWith(
+                createImage({
+                    className: 'github-enhancer-image-preview',
+
+                    src: rawUrl,
+
+                    title: filename,
                 })
-                .then(resolve)
-                .catch(reject);
-        });
-    }
-
-    // =========================================================================
-    // File List Beautifier
-    // =========================================================================
-
-    function beautifyFileList() {
-        state.theme = isDarkTheme() ? 'dark' : 'light';
-
-        const selectors = [
-            '.react-directory-truncate',
-            'a.js-navigation-open',
-
-            'table a[href*="/blob/"]',
-            'table a[href*="/tree/"]'
-        ];
-
-        const elements =
-            document.querySelectorAll(
-                selectors.join(',')
-            );
-
-        for (const element of elements) {
-            processFileElement(
-                element
-            );
-        }
-    }
-
-    function processFileElement(element) {
-        const link =
-            element.matches('a')
-                ? element
-                : element.querySelector(
-                    'a[href]'
-                );
-
-        if (!link) {
-            return;
-        }
-
-        if (
-            link.hasAttribute(
-                PROCESSED_ATTR
-            )
-        ) {
-            return;
-        }
-
-        const href = link.href;
-
-        if (!href) {
-            return;
-        }
-
-        let url;
-
-        try {
-            url = new URL(href);
-        } catch {
-            return;
-        }
-
-        if (
-            url.hostname !== 'github.com'
-        ) {
-            return;
-        }
-
-        // ---------------------------------------------------------------------
-        // Folder
-        // ---------------------------------------------------------------------
-
-        if (
-            url.pathname.includes(
-                '/tree/'
-            )
-        ) {
-            link.setAttribute(
-                FILE_TYPE_ATTR,
-                'folder'
-            );
-
-            link.setAttribute(
-                PROCESSED_ATTR,
-                'true'
-            );
-
-            return;
-        }
-
-        // ---------------------------------------------------------------------
-        // File
-        // ---------------------------------------------------------------------
-
-        if (
-            !url.pathname.includes(
-                '/blob/'
-            )
-        ) {
-            return;
-        }
-
-        const filename =
-            getFilename(url);
-
-        if (!filename) {
-            return;
-        }
-
-        let type =
-            getFileType(filename);
-
-        if (
-            state.customColors[
-                filename
-            ]
-        ) {
-            type = filename;
-        }
-
-        link.setAttribute(
-            FILE_TYPE_ATTR,
-            type
-        );
-
-        applyFileColor(
-            link,
-            type
-        );
-
-        const icon =
-            findFileIcon(link);
-
-        if (icon) {
-            replaceFileIcon(
-                icon,
-                url,
-                filename,
-                type
             );
         }
 
-        link.setAttribute(
-            PROCESSED_ATTR,
-            'true'
-        );
-    }
+        function getCustomIcon(filename, type) {
+            const filenameConfig = state.customColors[filename];
 
-    function resetProcessedFiles() {
-        document
-            .querySelectorAll(
-                `[${PROCESSED_ATTR}]`
-            )
-            .forEach(element => {
-                element.removeAttribute(
-                    PROCESSED_ATTR
-                );
-            });
-    }
-
-    // =========================================================================
-    // File Information
-    // =========================================================================
-
-    function getFilename(url) {
-        try {
-            return decodeURIComponent(
-                url.pathname
-                    .split('/')
-                    .pop() || ''
-            ).toLowerCase();
-        } catch {
-            return '';
-        }
-    }
-
-    function getFileType(filename) {
-        const match =
-            filename.match(
-                /\.([^.]+)$/
-            );
-
-        if (!match) {
-            return filename.toLowerCase();
-        }
-
-        return match[1].toLowerCase();
-    }
-
-    // =========================================================================
-    // File Colors
-    // =========================================================================
-
-    function applyFileColor(
-        link,
-        type
-    ) {
-        const color =
-            getColorForType(type);
-
-        if (!color) {
-            return;
-        }
-
-        link.style.setProperty(
-            'color',
-            color,
-            'important'
-        );
-    }
-
-    function getColorForType(type) {
-        const custom =
-            state.customColors[type];
-
-        /*
-         * Support either:
-         *
-         * {
-         *   "js": {
-         *      "color": "#..."
-         *   }
-         * }
-         *
-         * or a simple string.
-         */
-        if (
-            typeof custom === 'string'
-        ) {
-            return custom;
-        }
-
-        if (
-            custom &&
-            typeof custom === 'object' &&
-            custom.color
-        ) {
-            return custom.color;
-        }
-
-        const theme =
-            state.theme || (isDarkTheme() ? 'dark' : 'light');
-
-        const cacheKey =
-            `${theme}:${type}`;
-
-        if (
-            state.generatedColors.has(
-                cacheKey
-            )
-        ) {
-            return state.generatedColors.get(
-                cacheKey
-            );
-        }
-
-        const config =
-            getConfig();
-
-        const hash =
-            calculateHash(
-                type,
-                config.colorSeed1
-            );
-
-        const hue =
-            hash % 360;
-
-        const hueSection =
-            hue / 60;
-
-        const saturation =
-            (
-                hash *
-                config.colorSeed2 %
-                50
-            ) + 50;
-
-        const redFix =
-            hueSection < 1
-                ? 1 - hueSection
-                : hueSection > 4
-                    ? (
-                        hueSection - 4
-                    ) / 2
-                    : 0;
-
-        const blueFix =
-            (
-                hueSection < 3 ||
-                hueSection > 5
-                    ? 0
-                    : hueSection < 4
-                        ? hueSection - 3
-                        : 5 - hueSection
-            ) * 3;
-
-        const [
-            lumaBias,
-            lumaAmp,
-            lumaFix
-        ] =
-            theme === 'dark'
-                ? [30, 50, 12]
-                : [25, 15, 0];
-
-        const lightness =
-            Math.floor(
-                (
-                    hash *
-                    config.colorSeed3
-                ) %
-                lumaAmp +
-                lumaBias +
-                (
-                    (
-                        redFix +
-                        blueFix
-                    ) *
-                    lumaFix *
-                    saturation /
-                    100
-                )
-            );
-
-        const color =
-            `hsl(${hue} ${Math.floor(
-                saturation
-            )}% ${lightness}%)`;
-
-        state.generatedColors.set(
-            cacheKey,
-            color
-        );
-
-        return color;
-    }
-
-    function calculateHash(
-        text,
-        seed
-    ) {
-        let hash = 0;
-
-        for (
-            let i = 0;
-            i < text.length;
-            i++
-        ) {
-            hash =
-                (
-                    (hash << 5) -
-                    hash
-                ) +
-                text.charCodeAt(i);
-
-            hash |= 0;
-        }
-
-        return Math.abs(
-            Math.imul(
-                hash,
-                seed
-            )
-        );
-    }
-
-    function isDarkTheme() {
-        const root =
-            document.documentElement;
-
-        if (
-            root.dataset.colorMode ===
-            'dark'
-        ) {
-            return true;
-        }
-
-        if (
-            root.dataset.colorMode ===
-            'light'
-        ) {
-            return false;
-        }
-
-        if (
-            root.dataset.darkTheme &&
-            !root.dataset.lightTheme
-        ) {
-            return true;
-        }
-
-        if (!document.body) {
-            return false;
-        }
-
-        const background =
-            getComputedStyle(
-                document.body
-            ).backgroundColor;
-
-        const values =
-            background
-                .match(/[\d.]+/g)
-                ?.map(Number);
-
-        if (
-            !values ||
-            values.length < 3
-        ) {
-            return false;
-        }
-
-        const [
-            red,
-            green,
-            blue
-        ] = values;
-
-        const luminance =
-            red * 0.2126 +
-            green * 0.7152 +
-            blue * 0.0722;
-
-        return luminance < 128;
-    }
-
-    // =========================================================================
-    // File Icons
-    // =========================================================================
-
-    function findFileIcon(link) {
-        const row =
-            link.closest(
-                [
-                    'tr',
-                    '[role="row"]',
-                    '.js-navigation-item',
-                    '.Box-row'
-                ].join(',')
-            );
-
-        if (!row) {
-            return null;
-        }
-
-        return (
-            row.querySelector(
-                [
-                    'svg.octicon-file',
-                    'svg.octicon-file-directory-fill',
-                    'svg.icon-file',
-                    'svg.icon-directory',
-                    'svg.octicon'
-                ].join(',')
-            ) ||
-            null
-        );
-    }
-
-    function replaceFileIcon(
-        icon,
-        url,
-        filename,
-        type
-    ) {
-        const customIcon =
-            getCustomIcon(
-                filename,
-                type
-            );
-
-        if (customIcon) {
-            const iconUrl =
-                resolveCustomIconUrl(
-                    customIcon
-                );
-
-            if (iconUrl) {
-                icon.replaceWith(
-                    createImage({
-                        className:
-                            'github-enhancer-file-icon',
-
-                        src:
-                            iconUrl,
-
-                        title:
-                            `${type.toUpperCase()} file`
-                    })
-                );
-
-                return;
+            if (filenameConfig && typeof filenameConfig === 'object' && filenameConfig.icon) {
+                return filenameConfig.icon;
             }
-        }
 
-        /*
-         * Display an actual image thumbnail when the repository item
-         * itself is an image.
-         */
-        if (
-            !IMAGE_EXTENSIONS.test(
-                type
-            )
-        ) {
-            return;
-        }
+            const typeConfig = state.customColors[type];
 
-        const rawUrl =
-            getRawGitHubUrl(url);
+            if (typeConfig && typeof typeConfig === 'object' && typeConfig.icon) {
+                return typeConfig.icon;
+            }
 
-        if (!rawUrl) {
-            return;
-        }
-
-        icon.replaceWith(
-            createImage({
-                className:
-                    'github-enhancer-image-preview',
-
-                src:
-                    rawUrl,
-
-                title:
-                    filename
-            })
-        );
-    }
-
-    function getCustomIcon(
-        filename,
-        type
-    ) {
-        const filenameConfig =
-            state.customColors[
-                filename
-            ];
-
-        if (
-            filenameConfig &&
-            typeof filenameConfig ===
-                'object' &&
-            filenameConfig.icon
-        ) {
-            return filenameConfig.icon;
-        }
-
-        const typeConfig =
-            state.customColors[
-                type
-            ];
-
-        if (
-            typeConfig &&
-            typeof typeConfig ===
-                'object' &&
-            typeConfig.icon
-        ) {
-            return typeConfig.icon;
-        }
-
-        return null;
-    }
-
-    function resolveCustomIconUrl(icon) {
-        if (
-            typeof icon !== 'string'
-        ) {
             return null;
         }
 
-        if (
-            icon.startsWith(
-                'https://'
-            ) ||
-            icon.startsWith(
-                'data:image/'
-            )
-        ) {
-            return icon;
-        }
+        function resolveCustomIconUrl(icon) {
+            if (typeof icon !== 'string') {
+                return null;
+            }
 
-        return (
-            'https://raw.githubusercontent.com/' +
-            'PKief/vscode-material-icon-theme/' +
-            'main/icons/' +
-            `${icon}.svg`
-        );
-    }
+            if (icon.startsWith('https://') || icon.startsWith('data:image/')) {
+                return icon;
+            }
 
-    function getRawGitHubUrl(url) {
-        if (
-            url.hostname !==
-            'github.com'
-        ) {
-            return null;
-        }
-
-        if (
-            !url.pathname.includes(
-                '/blob/'
-            )
-        ) {
-            return null;
-        }
-
-        /*
-         * Route through github.com/…/raw/… rather than raw.githubusercontent.com
-         * directly: GitHub redirects with a token, so private repos work too.
-         */
-        return (
-            'https://github.com' +
-            url.pathname.replace(
-                '/blob/',
-                '/raw/'
-            )
-        );
-    }
-
-    function createImage({
-        className,
-        src,
-        title = ''
-    }) {
-        const image =
-            document.createElement(
-                'img'
+            // The icon theme repo moved from PKief/ to material-extensions/;
+            // pointing at the new home saves a redirect per icon.
+            return (
+                'https://raw.githubusercontent.com/' +
+                'material-extensions/vscode-material-icon-theme/' +
+                'main/icons/' +
+                `${icon}.svg`
             );
+        }
 
-        image.className =
-            className;
+        function getRawGitHubUrl(url) {
+            if (url.hostname !== 'github.com') {
+                return null;
+            }
 
-        image.src =
-            src;
+            if (!url.pathname.includes('/blob/')) {
+                return null;
+            }
 
-        image.alt =
-            '';
+            /*
+             * Route through github.com/…/raw/… rather than raw.githubusercontent.com
+             * directly: GitHub redirects with a token, so private repos work too.
+             */
+            return 'https://github.com' + url.pathname.replace('/blob/', '/raw/');
+        }
 
-        image.title =
-            title;
+        function createImage({ className, src, title = '' }) {
+            const image = document.createElement('img');
 
-        image.loading =
-            'lazy';
+            image.className = className;
 
-        image.decoding =
-            'async';
+            image.src = src;
 
-        image.setAttribute(
-            'aria-hidden',
-            'true'
-        );
+            image.alt = '';
 
-        return image;
-    }
+            image.title = title;
 
-    // =========================================================================
-    // Start
-    // =========================================================================
+            image.loading = 'lazy';
 
+            image.decoding = 'async';
+
+            image.setAttribute('aria-hidden', 'true');
+
+            return image;
+        }
+
+        // =========================================================================
+        // Start
+        // =========================================================================
 
         initialize();
         registerSync(beautifyFileList);
@@ -1012,14 +713,14 @@
     // ===============================================================
 
     (function moduleImagePreview() {
-        const IMG_EXT = /\.(png|jpe?g|gif|tiff?|bmp|webp|avif|ico)$/i;
-        const SVG_EXT = /\.svg$/i;
-        const SPINNER = 'https://github.githubassets.com/images/spinners/octocat-spinner-32.gif';
+        const IMG_EXT = /\.(png|jpe?g|gif|tiff?|bmp|webp|avif|ico|svg)$/i;
         const STATE_KEY = 'gh-image-preview'; // same key as the original — old setting carries over
 
         const store = {
             get: () => (typeof GM_getValue == 'function' ? GM_getValue(STATE_KEY, '') : ''),
-            set: (v) => { if (typeof GM_setValue == 'function') GM_setValue(STATE_KEY, v); },
+            set: (v) => {
+                if (typeof GM_setValue == 'function') GM_setValue(STATE_KEY, v);
+            },
         };
         let state = ['tiled', 'fullw'].includes(store.get()) ? store.get() : '';
 
@@ -1057,7 +758,6 @@
             .ghp-fullw .ghp-thumb img { max-width: 100% ; height: auto }
             .ghp-thumb svg.ghp-icon { width: 64px ; height: 64px ; fill: var(--fgColor-muted, #656d76) }
             img.ghp-error { border: 3px solid #cf222e ; border-radius: 6px ; min-width: 32px ; min-height: 32px }`);
-
 
         const TILED_SVG = `
         <svg class="octicon" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 16 16">
@@ -1124,20 +824,14 @@
                 div.innerHTML = FOLDER_ICON;
                 return div;
             }
-            const raw = entry.href.replace('/blob/', '/raw/');
             if (IMG_EXT.test(entry.name)) {
                 const img = document.createElement('img');
                 img.loading = 'lazy';
+                img.decoding = 'async';
                 img.alt = entry.name;
                 img.addEventListener('error', () => img.classList.add('ghp-error'), { once: true });
-                img.src = raw;
-                div.append(img);
-            } else if (SVG_EXT.test(entry.name)) {
-                // raw SVGs come back text/plain — fetched lazily, inlined as base64
-                const img = document.createElement('img');
-                img.alt = entry.name;
-                img.src = SPINNER;
-                img.dataset.ghpSvg = raw;
+                // github.com/…/raw/… redirects with a token, so private repos work too
+                img.src = entry.href.replace('/blob/', '/raw/');
                 div.append(img);
             } else {
                 div.innerHTML = FILE_ICON;
@@ -1166,42 +860,6 @@
             });
 
             table.insertAdjacentElement('afterend', gallery);
-            lazyLoadSvgs(gallery);
-        }
-
-        function lazyLoadSvgs(scope) {
-            const imgs = $$('img[data-ghp-svg]', scope);
-            if (!imgs.length) return;
-            if (!('IntersectionObserver' in window)) {
-                imgs.forEach(loadSvg);
-                return;
-            }
-            const io = new IntersectionObserver((observed) => {
-                observed.forEach((e) => {
-                    if (!e.isIntersecting) return;
-                    io.unobserve(e.target);
-                    loadSvg(e.target);
-                });
-            });
-            imgs.forEach((img) => io.observe(img));
-        }
-
-        async function loadSvg(img) {
-            const src = img.dataset.ghpSvg;
-            if (!src) return;
-            delete img.dataset.ghpSvg;
-            try {
-                const res = await fetch(src);
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                const blob = await res.blob();
-                // Re-type the text/plain payload as SVG so the browser will render it.
-                const url = URL.createObjectURL(new Blob([blob], { type: 'image/svg+xml' }));
-                img.addEventListener('load', () => URL.revokeObjectURL(url), { once: true });
-                img.src = url;
-            } catch (e) {
-                img.classList.add('ghp-error');
-                img.title = 'Failed to load SVG preview';
-            }
         }
 
         function sync() {
@@ -1226,7 +884,8 @@
             }
 
             const entries = rowEntries(table);
-            const stale = !gallery ||
+            const stale =
+                !gallery ||
                 gallery.dataset.path !== window.location.pathname ||
                 gallery.dataset.count !== String(entries.length);
             if (stale) {
@@ -1253,129 +912,121 @@
     // ===============================================================
 
     (function moduleHtmlPreview() {
+        const BUTTON_ID = 'mb-github-html-preview';
+        const TOOLTIP_ID = 'mb-github-html-preview-tooltip';
+        const PREVIEW_BASE = 'https://htmlpreview.github.io/?';
 
+        // -------------------------------------------------------------------------
+        // Determine whether the current page is an HTML file in GitHub's code view
+        // -------------------------------------------------------------------------
 
-    const BUTTON_ID = 'mb-github-html-preview';
-    const TOOLTIP_ID = 'mb-github-html-preview-tooltip';
-    const PREVIEW_BASE = 'https://htmlpreview.github.io/?';
+        function isHtmlFilePage() {
+            return (
+                location.hostname === 'github.com' &&
+                location.pathname.includes('/blob/') &&
+                /\.html$/i.test(location.pathname)
+            );
+        }
 
-    // -------------------------------------------------------------------------
-    // Determine whether the current page is an HTML file in GitHub's code view
-    // -------------------------------------------------------------------------
+        // Strip query strings such as ?plain=1 and hashes from the source URL.
+        function getFileUrl() {
+            return location.origin + location.pathname;
+        }
 
-    function isHtmlFilePage() {
-        return (
-            location.hostname === 'github.com' &&
-            location.pathname.includes('/blob/') &&
-            /\.html$/i.test(location.pathname)
-        );
-    }
+        function getPreviewUrl() {
+            return PREVIEW_BASE + getFileUrl();
+        }
 
-    // Strip query strings such as ?plain=1 and hashes from the source URL.
-    function getFileUrl() {
-        return location.origin + location.pathname;
-    }
+        // -------------------------------------------------------------------------
+        // Locate GitHub's "Add to space" button
+        // -------------------------------------------------------------------------
 
-    function getPreviewUrl() {
-        return PREVIEW_BASE + getFileUrl();
-    }
+        function getAccessibleText(element) {
+            const parts = [
+                element.getAttribute('aria-label'),
+                element.getAttribute('title'),
+                element.textContent,
+            ];
 
-    // -------------------------------------------------------------------------
-    // Locate GitHub's "Add to space" button
-    // -------------------------------------------------------------------------
+            const labelledBy = element.getAttribute('aria-labelledby');
 
-    function getAccessibleText(element) {
-        const parts = [
-            element.getAttribute('aria-label'),
-            element.getAttribute('title'),
-            element.textContent
-        ];
-
-        const labelledBy = element.getAttribute('aria-labelledby');
-
-        if (labelledBy) {
-            for (const id of labelledBy.split(/\s+/)) {
-                const label = document.getElementById(id);
-                if (label) {
-                    parts.push(label.textContent);
+            if (labelledBy) {
+                for (const id of labelledBy.split(/\s+/)) {
+                    const label = document.getElementById(id);
+                    if (label) {
+                        parts.push(label.textContent);
+                    }
                 }
             }
+
+            return parts.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
         }
 
-        return parts
-            .filter(Boolean)
-            .join(' ')
-            .replace(/\s+/g, ' ')
-            .trim();
-    }
+        function findAddToSpaceButton() {
+            // Fast path for the normal accessible labels GitHub uses.
+            const selectors = [
+                'button[aria-label*="Add to space" i]',
+                'a[aria-label*="Add to space" i]',
+                '[role="button"][aria-label*="Add to space" i]',
+                'button[title*="Add to space" i]',
+                'a[title*="Add to space" i]',
+            ];
 
-    function findAddToSpaceButton() {
-        // Fast path for the normal accessible labels GitHub uses.
-        const selectors = [
-            'button[aria-label*="Add to space" i]',
-            'a[aria-label*="Add to space" i]',
-            '[role="button"][aria-label*="Add to space" i]',
-            'button[title*="Add to space" i]',
-            'a[title*="Add to space" i]'
-        ];
+            for (const selector of selectors) {
+                const element = document.querySelector(selector);
 
-        for (const selector of selectors) {
-            const element = document.querySelector(selector);
-
-            if (element) {
-                return element;
+                if (element) {
+                    return element;
+                }
             }
-        }
 
-        /*
-         * "Add to space" only exists for signed-in users with Copilot. Fall
-         * back to the raw-file controls in the same toolbar so everyone gets
-         * the button, and so we avoid the full-page scan below on every pass.
-         */
-        const toolbarFallbacks = [
-            'button[data-testid="copy-raw-button"]',
-            'button[data-testid="download-raw-button"]',
-            'a[data-testid="raw-button"]'
-        ];
+            /*
+             * "Add to space" only exists for signed-in users with Copilot. Fall
+             * back to the raw-file controls in the same toolbar so everyone gets
+             * the button, and so we avoid the full-page scan below on every pass.
+             */
+            const toolbarFallbacks = [
+                'button[data-testid="copy-raw-button"]',
+                'button[data-testid="download-raw-button"]',
+                'a[data-testid="raw-button"]',
+            ];
 
-        for (const selector of toolbarFallbacks) {
-            const element = document.querySelector(selector);
+            for (const selector of toolbarFallbacks) {
+                const element = document.querySelector(selector);
 
-            if (element) {
-                return element;
+                if (element) {
+                    return element;
+                }
             }
-        }
 
-        // Fallback in case GitHub changes the exact markup but keeps
-        // the accessible name.
-        const candidates = document.querySelectorAll(
-            'button, a, [role="button"]'
-        );
+            // Fallback in case GitHub changes the exact markup but keeps
+            // the accessible name.
+            const candidates = document.querySelectorAll('button, a, [role="button"]');
 
-        for (const element of candidates) {
-            const text = getAccessibleText(element).toLowerCase();
+            for (const element of candidates) {
+                const text = getAccessibleText(element).toLowerCase();
 
-            if (
-                text.includes('add to space') ||
-                text.includes('add file to space') ||
-                text.includes('add to copilot space')
-            ) {
-                return element;
+                if (
+                    text.includes('add to space') ||
+                    text.includes('add file to space') ||
+                    text.includes('add to copilot space')
+                ) {
+                    return element;
+                }
             }
+
+            return null;
         }
 
-        return null;
-    }
+        // -------------------------------------------------------------------------
+        // Icon
+        //
+        // Recreates the uploaded </> rectangle icon using currentColor so it
+        // automatically matches GitHub's current foreground color.
+        // -------------------------------------------------------------------------
 
-    // -------------------------------------------------------------------------
-    // Icon
-    //
-    // Recreates the uploaded </> rectangle icon using currentColor so it
-    // automatically matches GitHub's current foreground color.
-    // -------------------------------------------------------------------------
-
-    function getIcon() {
-        return `
+        function getIcon() {
+            return `
             <svg
                 aria-hidden="true"
                 width="16"
@@ -1419,266 +1070,246 @@
                 />
             </svg>
         `;
-    }
+        }
 
-    // -------------------------------------------------------------------------
-    // GitHub-style tooltip
-    // -------------------------------------------------------------------------
+        // -------------------------------------------------------------------------
+        // GitHub-style tooltip
+        // -------------------------------------------------------------------------
 
-    function getTooltip() {
-        let tooltip = document.getElementById(TOOLTIP_ID);
+        function getTooltip() {
+            let tooltip = document.getElementById(TOOLTIP_ID);
 
-        if (tooltip) {
+            if (tooltip) {
+                return tooltip;
+            }
+
+            tooltip = document.createElement('div');
+            tooltip.id = TOOLTIP_ID;
+            tooltip.textContent = 'Preview HTML';
+
+            Object.assign(tooltip.style, {
+                position: 'fixed',
+                zIndex: '2147483647',
+                display: 'none',
+
+                padding: '6px 8px',
+
+                fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+                fontSize: '12px',
+                fontWeight: '600',
+                lineHeight: '16px',
+
+                color: 'var(--fgColor-onEmphasis, var(--color-fg-on-emphasis, #ffffff))',
+
+                background: 'var(--bgColor-emphasis, var(--color-neutral-emphasis-plus, #24292f))',
+
+                borderRadius: '6px',
+                boxShadow: 'var(--shadow-resting-small, 0 1px 4px rgba(0,0,0,.20))',
+
+                whiteSpace: 'nowrap',
+                pointerEvents: 'none',
+                opacity: '0',
+
+                transition: 'opacity 80ms ease',
+            });
+
+            document.body.appendChild(tooltip);
+
             return tooltip;
         }
 
-        tooltip = document.createElement('div');
-        tooltip.id = TOOLTIP_ID;
-        tooltip.textContent = 'Preview HTML';
+        function showTooltip(button) {
+            const tooltip = getTooltip();
+            const rect = button.getBoundingClientRect();
 
-        Object.assign(tooltip.style, {
-            position: 'fixed',
-            zIndex: '2147483647',
-            display: 'none',
+            tooltip.style.display = 'block';
+            tooltip.style.opacity = '0';
 
-            padding: '6px 8px',
+            // Calculate after display:block so width is available.
+            const tooltipRect = tooltip.getBoundingClientRect();
 
-            fontFamily:
-                '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-            fontSize: '12px',
-            fontWeight: '600',
-            lineHeight: '16px',
+            let left = rect.left + rect.width / 2 - tooltipRect.width / 2;
 
-            color:
-                'var(--fgColor-onEmphasis, var(--color-fg-on-emphasis, #ffffff))',
+            let top = rect.bottom + 8;
 
-            background:
-                'var(--bgColor-emphasis, var(--color-neutral-emphasis-plus, #24292f))',
+            // Keep tooltip inside viewport.
+            left = Math.max(8, Math.min(left, window.innerWidth - tooltipRect.width - 8));
 
-            borderRadius: '6px',
-            boxShadow: 'var(--shadow-resting-small, 0 1px 4px rgba(0,0,0,.20))',
-
-            whiteSpace: 'nowrap',
-            pointerEvents: 'none',
-            opacity: '0',
-
-            transition: 'opacity 80ms ease'
-        });
-
-        document.body.appendChild(tooltip);
-
-        return tooltip;
-    }
-
-    function showTooltip(button) {
-        const tooltip = getTooltip();
-        const rect = button.getBoundingClientRect();
-
-        tooltip.style.display = 'block';
-        tooltip.style.opacity = '0';
-
-        // Calculate after display:block so width is available.
-        const tooltipRect = tooltip.getBoundingClientRect();
-
-        let left =
-            rect.left +
-            rect.width / 2 -
-            tooltipRect.width / 2;
-
-        let top = rect.bottom + 8;
-
-        // Keep tooltip inside viewport.
-        left = Math.max(
-            8,
-            Math.min(
-                left,
-                window.innerWidth - tooltipRect.width - 8
-            )
-        );
-
-        // If there isn't enough room below the button, display above it.
-        if (top + tooltipRect.height > window.innerHeight - 8) {
-            top = rect.top - tooltipRect.height - 8;
-        }
-
-        tooltip.style.left = `${left}px`;
-        tooltip.style.top = `${top}px`;
-
-        requestAnimationFrame(() => {
-            tooltip.style.opacity = '1';
-        });
-    }
-
-    function hideTooltip() {
-        const tooltip = document.getElementById(TOOLTIP_ID);
-
-        if (!tooltip) {
-            return;
-        }
-
-        tooltip.style.opacity = '0';
-
-        setTimeout(() => {
-            if (tooltip.style.opacity === '0') {
-                tooltip.style.display = 'none';
+            // If there isn't enough room below the button, display above it.
+            if (top + tooltipRect.height > window.innerHeight - 8) {
+                top = rect.top - tooltipRect.height - 8;
             }
-        }, 100);
-    }
 
-    // -------------------------------------------------------------------------
-    // Create button
-    // -------------------------------------------------------------------------
+            tooltip.style.left = `${left}px`;
+            tooltip.style.top = `${top}px`;
 
-    function createPreviewButton(spaceButton) {
-        /*
-         * Copy GitHub's actual Add to space button.
-         *
-         * This is more reliable than trying to reproduce Primer's CSS classes
-         * ourselves and means the preview button automatically inherits changes
-         * GitHub makes to:
-         *
-         *   - size
-         *   - border
-         *   - border radius
-         *   - hover state
-         *   - light mode
-         *   - dark mode
-         *   - high contrast themes
-         */
-
-        const button = spaceButton.cloneNode(true);
-
-        button.id = BUTTON_ID;
-
-        // Remove duplicated IDs from anything GitHub placed inside the button.
-        button.querySelectorAll('[id]').forEach(element => {
-            element.removeAttribute('id');
-        });
-
-        // Remove attributes that may still point at GitHub's Add-to-Space
-        // menu/controllers.
-        const attributesToRemove = [
-            'aria-expanded',
-            'aria-haspopup',
-            'aria-controls',
-            'aria-describedby',
-            'aria-labelledby',
-            'data-action',
-            'data-target',
-            'data-menu-button',
-            'data-hotkey',
-            'data-testid', // or the next sync pass would anchor on our own clone
-            'command',
-            'commandfor',
-            'popovertarget',
-            'popovertargetaction'
-        ];
-
-        for (const attribute of attributesToRemove) {
-            button.removeAttribute(attribute);
+            requestAnimationFrame(() => {
+                tooltip.style.opacity = '1';
+            });
         }
 
-        // Make sure it isn't disabled because of anything copied from GitHub.
-        button.removeAttribute('disabled');
+        function hideTooltip() {
+            const tooltip = document.getElementById(TOOLTIP_ID);
 
-        // Accessibility.
-        button.setAttribute('aria-label', 'Preview HTML');
+            if (!tooltip) {
+                return;
+            }
 
-        // Native fallback tooltip.
-        button.setAttribute('title', 'Preview HTML');
+            tooltip.style.opacity = '0';
 
-        // Replace GitHub's icon with the custom </> icon.
-        button.innerHTML = getIcon();
-
-        // If GitHub's control is a normal button.
-        if (button.tagName === 'BUTTON') {
-            button.type = 'button';
+            setTimeout(() => {
+                if (tooltip.style.opacity === '0') {
+                    tooltip.style.display = 'none';
+                }
+            }, 100);
         }
 
-        // If GitHub happens to implement the source control as an anchor.
-        if (button.tagName === 'A') {
-            button.href = getPreviewUrl();
-            button.target = '_blank';
-            button.rel = 'noopener noreferrer';
+        // -------------------------------------------------------------------------
+        // Create button
+        // -------------------------------------------------------------------------
+
+        function createPreviewButton(spaceButton) {
+            /*
+             * Copy GitHub's actual Add to space button.
+             *
+             * This is more reliable than trying to reproduce Primer's CSS classes
+             * ourselves and means the preview button automatically inherits changes
+             * GitHub makes to:
+             *
+             *   - size
+             *   - border
+             *   - border radius
+             *   - hover state
+             *   - light mode
+             *   - dark mode
+             *   - high contrast themes
+             */
+
+            const button = spaceButton.cloneNode(true);
+
+            button.id = BUTTON_ID;
+
+            // Remove duplicated IDs from anything GitHub placed inside the button.
+            button.querySelectorAll('[id]').forEach((element) => {
+                element.removeAttribute('id');
+            });
+
+            // Remove attributes that may still point at GitHub's Add-to-Space
+            // menu/controllers.
+            const attributesToRemove = [
+                'aria-expanded',
+                'aria-haspopup',
+                'aria-controls',
+                'aria-describedby',
+                'aria-labelledby',
+                'data-action',
+                'data-target',
+                'data-menu-button',
+                'data-hotkey',
+                'data-testid', // or the next sync pass would anchor on our own clone
+                'command',
+                'commandfor',
+                'popovertarget',
+                'popovertargetaction',
+            ];
+
+            for (const attribute of attributesToRemove) {
+                button.removeAttribute(attribute);
+            }
+
+            // Make sure it isn't disabled because of anything copied from GitHub.
+            button.removeAttribute('disabled');
+
+            // Accessibility.
+            button.setAttribute('aria-label', 'Preview HTML');
+
+            // Native fallback tooltip.
+            button.setAttribute('title', 'Preview HTML');
+
+            // Replace GitHub's icon with the custom </> icon.
+            button.innerHTML = getIcon();
+
+            // If GitHub's control is a normal button.
+            if (button.tagName === 'BUTTON') {
+                button.type = 'button';
+            }
+
+            // If GitHub happens to implement the source control as an anchor.
+            if (button.tagName === 'A') {
+                button.href = getPreviewUrl();
+                button.target = '_blank';
+                button.rel = 'noopener noreferrer';
+            }
+
+            button.addEventListener(
+                'click',
+                (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    event.stopImmediatePropagation();
+
+                    hideTooltip();
+
+                    window.open(getPreviewUrl(), '_blank', 'noopener,noreferrer');
+                },
+                true
+            );
+
+            button.addEventListener('mouseenter', () => {
+                showTooltip(button);
+            });
+
+            button.addEventListener('mouseleave', hideTooltip);
+
+            button.addEventListener('focus', () => {
+                showTooltip(button);
+            });
+
+            button.addEventListener('blur', hideTooltip);
+
+            return button;
         }
 
-        button.addEventListener(
-            'click',
-            event => {
-                event.preventDefault();
-                event.stopPropagation();
-                event.stopImmediatePropagation();
+        // -------------------------------------------------------------------------
+        // Main update
+        // -------------------------------------------------------------------------
 
+        function updateButton() {
+            const existingButton = document.getElementById(BUTTON_ID);
+
+            // Remove the button if we navigated away from an HTML file.
+            if (!isHtmlFilePage()) {
+                existingButton?.remove();
                 hideTooltip();
+                return;
+            }
 
-                window.open(
-                    getPreviewUrl(),
-                    '_blank',
-                    'noopener,noreferrer'
-                );
-            },
-            true
-        );
+            const spaceButton = findAddToSpaceButton();
 
-        button.addEventListener('mouseenter', () => {
-            showTooltip(button);
-        });
+            if (!spaceButton) {
+                return;
+            }
 
-        button.addEventListener('mouseleave', hideTooltip);
+            // GitHub may rebuild its toolbar during Turbo navigation.
+            if (
+                existingButton &&
+                existingButton.isConnected &&
+                existingButton.parentElement === spaceButton.parentElement
+            ) {
+                return;
+            }
 
-        button.addEventListener('focus', () => {
-            showTooltip(button);
-        });
-
-        button.addEventListener('blur', hideTooltip);
-
-        return button;
-    }
-
-    // -------------------------------------------------------------------------
-    // Main update
-    // -------------------------------------------------------------------------
-
-    function updateButton() {
-        const existingButton = document.getElementById(BUTTON_ID);
-
-        // Remove the button if we navigated away from an HTML file.
-        if (!isHtmlFilePage()) {
             existingButton?.remove();
-            hideTooltip();
-            return;
+
+            const previewButton = createPreviewButton(spaceButton);
+
+            /*
+             * Insert immediately before Add to space:
+             *
+             * [ Preview HTML ] [ Add to space ]
+             */
+            spaceButton.parentNode.insertBefore(previewButton, spaceButton);
         }
-
-        const spaceButton = findAddToSpaceButton();
-
-        if (!spaceButton) {
-            return;
-        }
-
-        // GitHub may rebuild its toolbar during Turbo navigation.
-        if (
-            existingButton &&
-            existingButton.isConnected &&
-            existingButton.parentElement === spaceButton.parentElement
-        ) {
-            return;
-        }
-
-        existingButton?.remove();
-
-        const previewButton = createPreviewButton(spaceButton);
-
-        /*
-         * Insert immediately before Add to space:
-         *
-         * [ Preview HTML ] [ Add to space ]
-         */
-        spaceButton.parentNode.insertBefore(
-            previewButton,
-            spaceButton
-        );
-    }
-
 
         registerSync(updateButton);
     })();
@@ -1815,11 +1446,6 @@
         const TOAST_ID = 'ghs-clone-toast';
         const TOAST_MS = 1800;
 
-        const RESERVED = new Set([
-            'settings', 'marketplace', 'notifications', 'organizations', 'orgs',
-            'users', 'topics', 'collections', 'events', 'sponsors', 'search'
-        ]);
-
         addStyle(`
             #${BUTTON_ID} { width: auto; min-width: 32px }
             #${BUTTON_ID} svg { display: block; pointer-events: none }
@@ -1844,16 +1470,6 @@
 
         // -- Repository detection ---------------------------------------------
 
-        function getRepositoryName() {
-            // GitHub exposes the current repo in page metadata; prefer that over the URL.
-            const meta = $('meta[name="octolytics-dimension-repository_nwo"]');
-            if (meta?.content?.includes('/')) return meta.content;
-
-            const match = location.pathname.match(/^\/([^/]+)\/([^/]+)(?:\/|$)/);
-            if (!match || RESERVED.has(match[1].toLowerCase())) return null;
-            return `${match[1]}/${match[2]}`;
-        }
-
         function getCloneCommand() {
             const repo = getRepositoryName();
             return repo ? `git clone --recurse-submodules https://github.com/${repo}.git` : null;
@@ -1864,7 +1480,9 @@
         function isVisible(el) {
             if (!el) return false;
             const style = getComputedStyle(el);
-            return style.display !== 'none' && style.visibility !== 'hidden' && el.getClientRects().length > 0;
+            return (
+                style.display !== 'none' && style.visibility !== 'hidden' && el.getClientRects().length > 0
+            );
         }
 
         function findCodeButton() {
@@ -1873,9 +1491,11 @@
                 if (btn && isVisible(btn)) return btn;
             }
             // Fallback for GitHub UI changes: any visible button whose text is exactly "Code".
-            return $$('button').find(
-                (btn) => isVisible(btn) && btn.textContent.replace(/\s+/g, ' ').trim() === 'Code'
-            ) || null;
+            return (
+                $$('button').find(
+                    (btn) => isVisible(btn) && btn.textContent.replace(/\s+/g, ' ').trim() === 'Code'
+                ) || null
+            );
         }
 
         // -- Icon --------------------------------------------------------------
@@ -1892,7 +1512,7 @@
 
             for (const d of [
                 'M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z',
-                'M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z'
+                'M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z',
             ]) {
                 const path = document.createElementNS(ns, 'path');
                 path.setAttribute('d', d);
@@ -1905,10 +1525,20 @@
 
         async function copyText(text) {
             if (typeof GM_setClipboard === 'function') {
-                try { GM_setClipboard(text); return true; } catch { /* fall through */ }
+                try {
+                    GM_setClipboard(text);
+                    return true;
+                } catch {
+                    /* fall through */
+                }
             }
             if (navigator.clipboard?.writeText) {
-                try { await navigator.clipboard.writeText(text); return true; } catch { /* fall through */ }
+                try {
+                    await navigator.clipboard.writeText(text);
+                    return true;
+                } catch {
+                    /* fall through */
+                }
             }
             // Legacy fallback.
             const ta = document.createElement('textarea');
@@ -1918,7 +1548,11 @@
             document.body.appendChild(ta);
             ta.select();
             let ok = false;
-            try { ok = document.execCommand('copy'); } catch { ok = false; }
+            try {
+                ok = document.execCommand('copy');
+            } catch {
+                ok = false;
+            }
             ta.remove();
             return ok;
         }
@@ -1966,7 +1600,11 @@
             }
 
             // Already attached to the current Code button for this repo — nothing to do.
-            if (existing && existing.dataset.command === command && existing.previousElementSibling === codeButton) {
+            if (
+                existing &&
+                existing.dataset.command === command &&
+                existing.previousElementSibling === codeButton
+            ) {
                 return;
             }
             existing?.remove();
@@ -1985,10 +1623,21 @@
 
             // Strip the Code dropdown's behavior while keeping its visual attributes.
             for (const attr of [
-                'aria-expanded', 'aria-haspopup', 'aria-controls', 'aria-describedby', 'aria-labelledby',
-                'data-action', 'data-target', 'data-menu-button', 'data-hotkey',
+                'aria-expanded',
+                'aria-haspopup',
+                'aria-controls',
+                'aria-describedby',
+                'aria-labelledby',
+                'data-action',
+                'data-target',
+                'data-menu-button',
+                'data-hotkey',
                 'data-testid', // or findCodeButton() could match our own clone
-                'command', 'commandfor', 'popovertarget', 'popovertargetaction', 'disabled'
+                'command',
+                'commandfor',
+                'popovertarget',
+                'popovertargetaction',
+                'disabled',
             ]) {
                 button.removeAttribute(attr);
             }
@@ -2000,7 +1649,7 @@
             // Drop the original leading/trailing visuals (terminal icon, dropdown caret).
             $$(
                 '[data-component="buttonLeadingVisual"], [data-component="buttonTrailingVisual"], ' +
-                '[data-component="leadingVisual"], [data-component="trailingVisual"]',
+                    '[data-component="leadingVisual"], [data-component="trailingVisual"]',
                 button
             ).forEach((el) => el.remove());
 
@@ -2019,12 +1668,16 @@
              * cloneNode() doesn't copy listeners, but GitHub's delegated dropdown
              * handlers may still match copied attributes — capture and stop the click.
              */
-            button.addEventListener('click', (event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                event.stopImmediatePropagation();
-                copyCloneCommand(command);
-            }, true);
+            button.addEventListener(
+                'click',
+                (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    event.stopImmediatePropagation();
+                    copyCloneCommand(command);
+                },
+                true
+            );
 
             // [ Code ▼ ] [ Copy ]
             codeButton.insertAdjacentElement('afterend', button);
@@ -2044,11 +1697,6 @@
         const NODE_ID = 'ghs-deepwiki';
         const LABEL = 'DeepWiki';
 
-        const RESERVED = new Set([
-            'settings', 'marketplace', 'notifications', 'organizations', 'orgs',
-            'users', 'topics', 'collections', 'events', 'sponsors', 'search'
-        ]);
-
         // DeepWiki logo (three-tone, as supplied), sized like the neighbouring octicons.
         const ICON = `
         <svg class="octicon mr-2" aria-hidden="true" width="16" height="16" viewBox="110 110 460 500" xmlns="http://www.w3.org/2000/svg">
@@ -2056,15 +1704,6 @@
             <path fill="#3969ca" d="M141.09,317.65l50.97,29.43c1.83,1.05,3.86,1.58,5.9,1.58s4.08-.53,5.9-1.58l50.97-29.43c.08-.04.13-.11.2-.16.78-.48,1.51-1.02,2.15-1.66.1-.1.18-.21.28-.31.57-.6,1.08-1.26,1.51-1.97.07-.12.15-.22.22-.34.44-.77.77-1.6,1.03-2.47.05-.19.1-.37.14-.56.22-.89.37-1.81.37-2.76v-29.43c0-11.36,6.11-21.95,15.96-27.63s22.06-5.68,31.91,0l25.49,14.71c.82.48,1.69.8,2.57,1.06.19.06.37.11.56.16.87.21,1.76.34,2.64.35.04,0,.09.02.13.02.1,0,.19-.04.29-.04.83-.02,1.65-.13,2.45-.32.14-.03.28-.05.41-.09.87-.24,1.71-.6,2.51-1.04.08-.04.16-.06.24-.1l50.97-29.43c3.65-2.11,5.9-6.01,5.9-10.22v-58.86c0-4.22-2.25-8.11-5.9-10.22l-50.97-29.43c-3.65-2.11-8.15-2.11-11.81,0l-50.97,29.43c-.08.04-.13.11-.2.16-.78.48-1.51,1.02-2.15,1.66-.1.1-.18.21-.28.31-.57.6-1.08,1.26-1.51,1.97-.07.12-.15.22-.22.34-.44.77-.77,1.6-1.03,2.47-.05.19-.1.37-.14.56-.22.89-.37,1.81-.37,2.76v29.43c0,11.36-6.11,21.95-15.95,27.63-9.84,5.68-22.07,5.68-31.91,0l-25.49-14.71c-.82-.48-1.69-.8-2.58-1.06-.19-.06-.37-.11-.55-.16-.88-.21-1.76-.34-2.65-.35-.13,0-.26.02-.4.02-.83.02-1.66.13-2.47.32-.13.03-.27.05-.4.09-.87.24-1.71.6-2.51,1.04-.08.04-.16.06-.24.1l-50.97,29.43c-3.65,2.11-5.9,6.01-5.9,10.22v58.86c0,4.22,2.25,8.11,5.9,10.22Z"/>
             <path fill="#0294de" d="M396.88,484.35l-50.97-29.43c-.08-.04-.17-.06-.24-.1-.8-.44-1.64-.79-2.51-1.03-.14-.04-.27-.06-.41-.09-.81-.19-1.64-.3-2.47-.32-.13,0-.26-.02-.39-.02-.89,0-1.78.13-2.66.35-.18.04-.36.1-.54.15-.88.26-1.76.59-2.58,1.07l-25.49,14.72c-9.84,5.68-22.06,5.68-31.9,0-9.84-5.68-15.96-16.27-15.96-27.63v-29.43c0-.95-.15-1.87-.37-2.76-.05-.19-.09-.37-.14-.56-.25-.86-.59-1.69-1.03-2.47-.07-.12-.15-.22-.22-.34-.43-.71-.94-1.37-1.51-1.97-.1-.1-.18-.21-.28-.31-.65-.63-1.37-1.18-2.15-1.66-.07-.04-.13-.11-.2-.16l-50.97-29.43c-3.65-2.11-8.15-2.11-11.81,0l-50.97,29.43c-3.65,2.11-5.9,6.01-5.9,10.22v58.86c0,4.22,2.25,8.11,5.9,10.22l50.97,29.43c.08.04.17.06.25.1.8.44,1.63.79,2.5,1.03.14.04.29.06.43.09.8.19,1.61.3,2.43.32.1,0,.2.04.3.04.04,0,.09-.02.13-.02.88,0,1.77-.13,2.64-.34.19-.04.37-.1.56-.16.88-.26,1.75-.59,2.57-1.06l25.49-14.71c9.84-5.68,22.06-5.68,31.91,0,9.84,5.68,15.95,16.27,15.95,27.63v29.43c0,.95.15,1.87.37,2.76.05.19.09.37.14.56.25.86.59,1.69,1.03,2.47.07.12.15.22.22.34.43.71.94,1.37,1.51,1.97.1.1.18.21.28.31.65.63,1.37,1.18,2.15,1.66.07.04.13.11.2.16l50.97,29.43c1.83,1.05,3.86,1.58,5.9,1.58s4.08-.53,5.9-1.58l50.97-29.43c3.65-2.11,5.9-6.01,5.9-10.22v-58.86c0-4.22-2.25-8.11-5.9-10.22Z"/>
         </svg>`;
-
-        function getRepositoryName() {
-            const meta = $('meta[name="octolytics-dimension-repository_nwo"]');
-            if (meta?.content?.includes('/')) return meta.content;
-
-            const match = location.pathname.match(/^\/([^/]+)\/([^/]+)(?:\/|$)/);
-            if (!match || RESERVED.has(match[1].toLowerCase())) return null;
-            return `${match[1]}/${match[2]}`;
-        }
 
         /*
          * The About sidebar lists Readme / License / Activity / Stars /
@@ -2075,7 +1714,7 @@
         function findSidebarRow() {
             const rows = $$(
                 'a[href$="/forks"], a[href$="/watchers"], a[href$="/stargazers"], ' +
-                'a[href$="/activity"], a[href="#readme-ov-file"], a[href*="/blob/"][href*="LICENSE" i]'
+                    'a[href$="/activity"], a[href="#readme-ov-file"], a[href*="/blob/"][href*="LICENSE" i]'
             ).filter((a) => a.querySelector('svg.octicon') && a.closest('.BorderGrid-cell, .Layout-sidebar'));
             const last = rows[rows.length - 1] || null;
             return last ? { anchor: last, after: true } : null;
@@ -2086,7 +1725,8 @@
             return report ? { anchor: report, after: false } : null; // sit above "Report repository"
         }
 
-        const blockOf = (a) => (a.parentElement && a.parentElement.children.length === 1 ? a.parentElement : a);
+        const blockOf = (a) =>
+            a.parentElement && a.parentElement.children.length === 1 ? a.parentElement : a;
 
         function sync() {
             const existing = document.getElementById(NODE_ID);
@@ -2102,8 +1742,11 @@
             const block = blockOf(target.anchor);
             const neighbour = target.after ? 'previousElementSibling' : 'nextElementSibling';
 
-            if (existing && existing[neighbour] === block &&
-                (existing.matches('a') ? existing : $('a', existing))?.href === url) {
+            if (
+                existing &&
+                existing[neighbour] === block &&
+                (existing.matches('a') ? existing : $('a', existing))?.href === url
+            ) {
                 return;
             }
             existing?.remove();
@@ -2151,9 +1794,27 @@
     // frame-throttled observer runs every module's idempotent sync
     // ===============================================================
 
+    // Anything the suite itself inserts. Mutations made up solely of these
+    // nodes don't need another pass — every module is idempotent, so
+    // re-running them right after our own write would only burn a frame.
+    const OURS =
+        '#ghs-styles, [id^="ghs-"], [class^="ghs-"], [class*=" ghs-"], .ghp-gallery, .ghp-toggles, ' +
+        '#mb-github-html-preview, #mb-github-html-preview-tooltip, .ghtws-button, [class*="github-enhancer-"]';
+    const isOurs = (node) => {
+        const el = node.nodeType === 1 ? node : node.parentElement;
+        return !!el && !!el.closest(OURS);
+    };
+    const onlyOurs = (records) =>
+        records.every(
+            (r) =>
+                isOurs(r.target) ||
+                ((r.addedNodes.length || r.removedNodes.length) &&
+                    [...r.addedNodes, ...r.removedNodes].every(isOurs))
+        );
+
     let scheduled = false;
-    const observer = new MutationObserver(() => {
-        if (scheduled) return;
+    const observer = new MutationObserver((records) => {
+        if (scheduled || onlyOurs(records)) return;
         scheduled = true;
         requestAnimationFrame(() => {
             scheduled = false;
