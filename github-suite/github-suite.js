@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         GitHub Suite
 // @namespace    https://github.com/arrupe
-// @version      1.1.0
-// @description  Combines a Gitub folder download menu, file-type colors/icons, image preview galleries, a HTML preview button, and a wiki sidebar toggle.
+// @version      1.6.1
+// @description  Combines a GitHub folder download menu, file-type colors/icons, image preview galleries, a HTML preview button, a wiki sidebar toggle, a one-click recursive git clone command copier, a DeepWiki entry in the repo About sidebar, and hides "Report repository".
 // @author       arrupe
 // @license      WTFPL
 // @match        https://github.com/*
 // @noframes
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
+// @grant        GM_setClipboard
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @connect      raw.githubusercontent.com
@@ -25,11 +26,28 @@
     const $ = (sel, el) => (el || document).querySelector(sel);
     const $$ = (sel, el) => [...(el || document).querySelectorAll(sel)];
 
+    /*
+     * Modules register CSS while they load; it is injected as ONE <style>
+     * element when the suite starts (see "Shared observer" at the bottom).
+     * Anything added after that point is appended to the same element.
+     */
+    const cssBuffer = [];
+    let styleEl = null;
     function addStyle(css) {
-        const s = document.createElement('style');
-        s.textContent = css;
-        document.head.append(s);
-        return s;
+        if (styleEl) {
+            styleEl.textContent += '\n' + css;
+        } else {
+            cssBuffer.push(css);
+        }
+        return styleEl;
+    }
+    function flushStyles() {
+        if (styleEl || !cssBuffer.length) return;
+        styleEl = document.createElement('style');
+        styleEl.id = 'ghs-styles';
+        styleEl.textContent = cssBuffer.join('\n');
+        (document.head || document.documentElement).append(styleEl);
+        cssBuffer.length = 0;
     }
 
     const syncFns = [];
@@ -42,7 +60,7 @@
 
     // ===============================================================
     // MODULE 1 — Repository Enhancer (file-type colors/icons)
-    // wOxxOm, ChinaGodMan · MIT — clone-button feature removed
+    // wOxxOm, ChinaGodMan · MIT — clone button split out into MODULE 6
     // Embedded verbatim; only its private observer is disabled in
     // favor of the suite's shared one.
     // ===============================================================
@@ -59,7 +77,8 @@
         'github-file-list-beautifier-plus/colors.json';
 
     const COLORS_STORAGE_KEY = 'fileTypesColors';
-    const STYLE_ID = 'github-enhancer-styles';
+    const COLORS_FETCHED_KEY = 'fileTypesColorsFetchedAt';
+    const COLORS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // refresh the remote palette weekly
 
     const PROCESSED_ATTR = 'data-github-enhancer-processed';
     const FILE_TYPE_ATTR = 'data-github-enhancer-file-type';
@@ -71,14 +90,19 @@
         colorSeed3: 179426453
     };
 
+    /*
+     * Extensions that get an inline thumbnail. SVG is deliberately absent:
+     * GitHub serves raw SVGs as text/plain with X-Content-Type-Options:
+     * nosniff, so an <img src> pointing at them never renders. (Module 2
+     * handles SVG previews by fetching and inlining them.)
+     */
     const IMAGE_EXTENSIONS =
-        /^(png|jpe?g|bmp|gif|webp|avif|cur|ico|svg)$/i;
+        /^(png|jpe?g|bmp|gif|webp|avif|cur|ico)$/i;
 
     const state = {
         customColors: {},
         generatedColors: new Map(),
-        scheduled: false,
-        observerStarted: false
+        theme: null // resolved once per sync pass, see beautifyFileList()
     };
 
     let cachedConfig = null;
@@ -90,9 +114,8 @@
     function initialize() {
         loadStoredColors();
         addStyles();
-        // startObserver(); — the suite's shared observer drives this module
-        scheduleEnhancement();
         loadRemoteColorsIfNeeded();
+        // The suite's shared observer drives every sync pass for this module.
     }
 
     // =========================================================================
@@ -100,14 +123,7 @@
     // =========================================================================
 
     function addStyles() {
-        if (document.getElementById(STYLE_ID)) {
-            return;
-        }
-
-        const style = document.createElement('style');
-        style.id = STYLE_ID;
-
-        style.textContent = `
+        addStyle(`
             .github-enhancer-file-icon {
                 width: 16px !important;
                 height: 16px !important;
@@ -128,11 +144,7 @@
             a[${FILE_TYPE_ATTR}="folder"] {
                 font-weight: 600 !important;
             }
-
-
-        `;
-
-        (document.head || document.documentElement).appendChild(style);
+        `);
     }
 
     // =========================================================================
@@ -212,7 +224,16 @@
     }
 
     async function loadRemoteColorsIfNeeded() {
-        if (Object.keys(state.customColors).length > 0) {
+        const haveColors = Object.keys(state.customColors).length > 0;
+
+        let fetchedAt = 0;
+        try {
+            fetchedAt = Number(GM_getValue(COLORS_FETCHED_KEY, 0)) || 0;
+        } catch {
+            // Storage is optional.
+        }
+
+        if (haveColors && Date.now() - fetchedAt < COLORS_TTL_MS) {
             return;
         }
 
@@ -227,24 +248,28 @@
                 return;
             }
 
+            const changed =
+                JSON.stringify(colors) !== JSON.stringify(state.customColors);
+
             state.customColors = colors;
 
             try {
-                GM_setValue(
-                    COLORS_STORAGE_KEY,
-                    colors
-                );
+                GM_setValue(COLORS_STORAGE_KEY, colors);
+                GM_setValue(COLORS_FETCHED_KEY, Date.now());
             } catch {
                 // Local caching is optional.
             }
 
             /*
              * Existing files may have been processed before the color
-             * configuration finished loading. Reset them so they can be
-             * processed again with the custom colors and icons.
+             * configuration finished loading (or with an older palette).
+             * Reset them so they can be processed again.
              */
-            resetProcessedFiles();
-            scheduleEnhancement();
+            if (changed) {
+                state.generatedColors.clear();
+                resetProcessedFiles();
+                beautifyFileList();
+            }
 
         } catch (error) {
             console.warn(
@@ -322,6 +347,8 @@
     // =========================================================================
 
     function beautifyFileList() {
+        state.theme = isDarkTheme() ? 'dark' : 'light';
+
         const selectors = [
             '.react-directory-truncate',
             'a.js-navigation-open',
@@ -555,9 +582,7 @@
         }
 
         const theme =
-            isDarkTheme()
-                ? 'dark'
-                : 'light';
+            state.theme || (isDarkTheme() ? 'dark' : 'light');
 
         const cacheKey =
             `${theme}:${type}`;
@@ -922,11 +947,15 @@
             return null;
         }
 
+        /*
+         * Route through github.com/…/raw/… rather than raw.githubusercontent.com
+         * directly: GitHub redirects with a token, so private repos work too.
+         */
         return (
-            'https://raw.githubusercontent.com' +
+            'https://github.com' +
             url.pathname.replace(
                 '/blob/',
-                '/'
+                '/raw/'
             )
         );
     }
@@ -968,75 +997,12 @@
     }
 
     // =========================================================================
-    // GitHub Dynamic Navigation
-    // =========================================================================
-
-    function enhancePage() {
-        state.scheduled = false;
-        beautifyFileList();
-    }
-
-    function scheduleEnhancement() {
-        if (state.scheduled) {
-            return;
-        }
-
-        state.scheduled = true;
-
-        requestAnimationFrame(
-            enhancePage
-        );
-    }
-
-    function startObserver() {
-        if (
-            state.observerStarted
-        ) {
-            return;
-        }
-
-        state.observerStarted = true;
-
-        const observer =
-            new MutationObserver(
-                scheduleEnhancement
-            );
-
-        observer.observe(
-            document.documentElement,
-            {
-                childList: true,
-                subtree: true
-            }
-        );
-
-        /*
-         * GitHub uses Turbo/client-side navigation, so URLs and repository
-         * content can change without a traditional page reload.
-         */
-        document.addEventListener(
-            'turbo:load',
-            scheduleEnhancement
-        );
-
-        document.addEventListener(
-            'pjax:end',
-            scheduleEnhancement
-        );
-
-        window.addEventListener(
-            'popstate',
-            scheduleEnhancement
-        );
-    }
-
-    // =========================================================================
     // Start
     // =========================================================================
 
 
         initialize();
-        registerSync(enhancePage);
+        registerSync(beautifyFileList);
     })();
 
     // ===============================================================
@@ -1221,14 +1187,17 @@
         }
 
         async function loadSvg(img) {
-            const url = img.dataset.ghpSvg;
-            if (!url) return;
+            const src = img.dataset.ghpSvg;
+            if (!src) return;
             delete img.dataset.ghpSvg;
             try {
-                const res = await fetch(url);
+                const res = await fetch(src);
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                const text = await res.text();
-                img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(text)));
+                const blob = await res.blob();
+                // Re-type the text/plain payload as SVG so the browser will render it.
+                const url = URL.createObjectURL(new Blob([blob], { type: 'image/svg+xml' }));
+                img.addEventListener('load', () => URL.revokeObjectURL(url), { once: true });
+                img.src = url;
             } catch (e) {
                 img.classList.add('ghp-error');
                 img.title = 'Failed to load SVG preview';
@@ -1351,6 +1320,25 @@
         ];
 
         for (const selector of selectors) {
+            const element = document.querySelector(selector);
+
+            if (element) {
+                return element;
+            }
+        }
+
+        /*
+         * "Add to space" only exists for signed-in users with Copilot. Fall
+         * back to the raw-file controls in the same toolbar so everyone gets
+         * the button, and so we avoid the full-page scan below on every pass.
+         */
+        const toolbarFallbacks = [
+            'button[data-testid="copy-raw-button"]',
+            'button[data-testid="download-raw-button"]',
+            'a[data-testid="raw-button"]'
+        ];
+
+        for (const selector of toolbarFallbacks) {
             const element = document.querySelector(selector);
 
             if (element) {
@@ -1573,12 +1561,17 @@
             'aria-expanded',
             'aria-haspopup',
             'aria-controls',
+            'aria-describedby',
             'aria-labelledby',
             'data-action',
             'data-target',
             'data-menu-button',
+            'data-hotkey',
+            'data-testid', // or the next sync pass would anchor on our own clone
+            'command',
+            'commandfor',
             'popovertarget',
-            'popoverTarget'
+            'popovertargetaction'
         ];
 
         for (const attribute of attributesToRemove) {
@@ -1778,11 +1771,11 @@
             if (typeof GM_setValue == 'function') GM_setValue(STATE_KEY, isHidden);
         }
 
-        document.body.addEventListener('click', (event) => {
-            const target = event.target;
-            if (target && target.classList && target.classList.contains(BTN_CLASS)) {
+        document.addEventListener('click', (event) => {
+            const button = event.target?.closest?.('.' + BTN_CLASS);
+            if (button) {
                 isHidden = !isHidden;
-                applySidebar(target);
+                applySidebar(button);
             }
         });
 
@@ -1812,6 +1805,348 @@
     })();
 
     // ===============================================================
+    // MODULE 6 — Copy clone command (from wOxxOm / ChinaGodMan's
+    // GitHub Repository Enhancer · MIT) — a one-click button beside
+    // GitHub's Code button that copies the recursive git clone command
+    // ===============================================================
+
+    (function moduleCloneButton() {
+        const BUTTON_ID = 'ghs-clone-button';
+        const TOAST_ID = 'ghs-clone-toast';
+        const TOAST_MS = 1800;
+
+        const RESERVED = new Set([
+            'settings', 'marketplace', 'notifications', 'organizations', 'orgs',
+            'users', 'topics', 'collections', 'events', 'sponsors', 'search'
+        ]);
+
+        addStyle(`
+            #${BUTTON_ID} { width: auto; min-width: 32px }
+            #${BUTTON_ID} svg { display: block; pointer-events: none }
+            #${TOAST_ID} {
+                position: fixed; top: 20px; right: 20px; z-index: 2147483647;
+                max-width: min(520px, calc(100vw - 40px));
+                padding: 8px 12px;
+                color: var(--fgColor-onEmphasis, var(--color-fg-on-emphasis, #fff));
+                background: var(--bgColor-success-emphasis, var(--color-success-emphasis, #1f883d));
+                border: 1px solid var(--borderColor-success-emphasis, var(--color-success-emphasis, #1f883d));
+                border-radius: 6px;
+                box-shadow: var(--shadow-resting-medium, 0 3px 12px rgba(27, 31, 36, .15));
+                font: 600 14px/20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+                pointer-events: none;
+                animation: ghs-clone-toast-in 120ms ease-out;
+            }
+            @keyframes ghs-clone-toast-in {
+                from { opacity: 0; transform: translateY(-4px) }
+                to   { opacity: 1; transform: translateY(0) }
+            }`);
+
+        // -- Repository detection ---------------------------------------------
+
+        function getRepositoryName() {
+            // GitHub exposes the current repo in page metadata; prefer that over the URL.
+            const meta = $('meta[name="octolytics-dimension-repository_nwo"]');
+            if (meta?.content?.includes('/')) return meta.content;
+
+            const match = location.pathname.match(/^\/([^/]+)\/([^/]+)(?:\/|$)/);
+            if (!match || RESERVED.has(match[1].toLowerCase())) return null;
+            return `${match[1]}/${match[2]}`;
+        }
+
+        function getCloneCommand() {
+            const repo = getRepositoryName();
+            return repo ? `git clone --recurse-submodules https://github.com/${repo}.git` : null;
+        }
+
+        // -- Locate GitHub's Code button ---------------------------------------
+
+        function isVisible(el) {
+            if (!el) return false;
+            const style = getComputedStyle(el);
+            return style.display !== 'none' && style.visibility !== 'hidden' && el.getClientRects().length > 0;
+        }
+
+        function findCodeButton() {
+            for (const sel of ['button[data-testid="code-button"]', 'button[aria-label="Code"]']) {
+                const btn = $(sel);
+                if (btn && isVisible(btn)) return btn;
+            }
+            // Fallback for GitHub UI changes: any visible button whose text is exactly "Code".
+            return $$('button').find(
+                (btn) => isVisible(btn) && btn.textContent.replace(/\s+/g, ' ').trim() === 'Code'
+            ) || null;
+        }
+
+        // -- Icon --------------------------------------------------------------
+
+        function createCopyIcon() {
+            const ns = 'http://www.w3.org/2000/svg';
+            const svg = document.createElementNS(ns, 'svg');
+            svg.setAttribute('aria-hidden', 'true');
+            svg.setAttribute('viewBox', '0 0 16 16');
+            svg.setAttribute('width', '16');
+            svg.setAttribute('height', '16');
+            svg.setAttribute('fill', 'currentColor');
+            svg.setAttribute('class', 'octicon octicon-copy');
+
+            for (const d of [
+                'M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z',
+                'M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z'
+            ]) {
+                const path = document.createElementNS(ns, 'path');
+                path.setAttribute('d', d);
+                svg.append(path);
+            }
+            return svg;
+        }
+
+        // -- Clipboard + toast -------------------------------------------------
+
+        async function copyText(text) {
+            if (typeof GM_setClipboard === 'function') {
+                try { GM_setClipboard(text); return true; } catch { /* fall through */ }
+            }
+            if (navigator.clipboard?.writeText) {
+                try { await navigator.clipboard.writeText(text); return true; } catch { /* fall through */ }
+            }
+            // Legacy fallback.
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.readOnly = true;
+            Object.assign(ta.style, { position: 'fixed', opacity: '0', pointerEvents: 'none' });
+            document.body.appendChild(ta);
+            ta.select();
+            let ok = false;
+            try { ok = document.execCommand('copy'); } catch { ok = false; }
+            ta.remove();
+            return ok;
+        }
+
+        function showToast(message) {
+            document.getElementById(TOAST_ID)?.remove();
+            const toast = document.createElement('div');
+            toast.id = TOAST_ID;
+            toast.textContent = message;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), TOAST_MS);
+        }
+
+        async function copyCloneCommand(command) {
+            const ok = await copyText(command);
+            showToast(ok ? 'Git clone command copied' : 'Unable to copy Git clone command');
+        }
+
+        // -- Button ------------------------------------------------------------
+
+        // The Code button only renders on the repo root and folder pages.
+        const CODE_PAGE = /^\/[^/]+\/[^/]+\/?(?:$|tree\/)/;
+
+        // Id used by the standalone "GitHub Repository Enhancer" userscript.
+        const STANDALONE_ID = 'github-enhancer-clone-button';
+
+        function sync() {
+            // Guarantee a single button: drop any stray duplicates of ours, and
+            // stand down entirely if the standalone Enhancer is also installed.
+            const ours = $$('#' + BUTTON_ID);
+            ours.slice(1).forEach((el) => el.remove());
+            const existing = ours[0] || null;
+
+            if (document.getElementById(STANDALONE_ID)) {
+                existing?.remove();
+                return;
+            }
+
+            const command = CODE_PAGE.test(location.pathname) ? getCloneCommand() : null;
+            const codeButton = command ? findCodeButton() : null;
+
+            if (!command || !codeButton) {
+                existing?.remove();
+                return;
+            }
+
+            // Already attached to the current Code button for this repo — nothing to do.
+            if (existing && existing.dataset.command === command && existing.previousElementSibling === codeButton) {
+                return;
+            }
+            existing?.remove();
+
+            /*
+             * Clone GitHub's actual Code button so the copy inherits its exact
+             * Primer styling (background, border, height, radius, hover/focus,
+             * light/dark/high-contrast themes) — including future Primer changes.
+             */
+            const button = codeButton.cloneNode(true);
+            button.id = BUTTON_ID;
+            button.dataset.command = command;
+
+            // Strip duplicate ids copied from inside the original button.
+            $$('[id]', button).forEach((el) => el.removeAttribute('id'));
+
+            // Strip the Code dropdown's behavior while keeping its visual attributes.
+            for (const attr of [
+                'aria-expanded', 'aria-haspopup', 'aria-controls', 'aria-describedby', 'aria-labelledby',
+                'data-action', 'data-target', 'data-menu-button', 'data-hotkey',
+                'data-testid', // or findCodeButton() could match our own clone
+                'command', 'commandfor', 'popovertarget', 'popovertargetaction', 'disabled'
+            ]) {
+                button.removeAttribute(attr);
+            }
+
+            button.type = 'button';
+            button.setAttribute('aria-label', 'Copy Git clone command');
+            button.title = 'Copy Git clone command';
+
+            // Drop the original leading/trailing visuals (terminal icon, dropdown caret).
+            $$(
+                '[data-component="buttonLeadingVisual"], [data-component="buttonTrailingVisual"], ' +
+                '[data-component="leadingVisual"], [data-component="trailingVisual"]',
+                button
+            ).forEach((el) => el.remove());
+
+            // Keep Primer's buttonContent wrapper for native icon alignment when present.
+            const content = $('[data-component="buttonContent"]', button);
+            if (content) {
+                content.replaceChildren(createCopyIcon());
+                for (const child of [...content.parentElement.children]) {
+                    if (child !== content) child.remove();
+                }
+            } else {
+                button.replaceChildren(createCopyIcon());
+            }
+
+            /*
+             * cloneNode() doesn't copy listeners, but GitHub's delegated dropdown
+             * handlers may still match copied attributes — capture and stop the click.
+             */
+            button.addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation();
+                copyCloneCommand(command);
+            }, true);
+
+            // [ Code ▼ ] [ Copy ]
+            codeButton.insertAdjacentElement('afterend', button);
+        }
+
+        registerSync(sync);
+    })();
+
+    // ===============================================================
+    // MODULE 7 — DeepWiki entry in the repo "About" sidebar: a
+    // "DeepWiki" row with an icon, styled and positioned like the
+    // Readme / license / stars / forks rows (inserted after the last
+    // of them), cloned from a sibling row so it matches GitHub exactly
+    // ===============================================================
+
+    (function moduleDeepWiki() {
+        const NODE_ID = 'ghs-deepwiki';
+        const LABEL = 'DeepWiki';
+
+        const RESERVED = new Set([
+            'settings', 'marketplace', 'notifications', 'organizations', 'orgs',
+            'users', 'topics', 'collections', 'events', 'sponsors', 'search'
+        ]);
+
+        // DeepWiki logo (three-tone, as supplied), sized like the neighbouring octicons.
+        const ICON = `
+        <svg class="octicon mr-2" aria-hidden="true" width="16" height="16" viewBox="110 110 460 500" xmlns="http://www.w3.org/2000/svg">
+            <path fill="#21c19a" d="M418.73,332.37c9.84-5.68,22.07-5.68,31.91,0l25.49,14.71c.82.48,1.69.8,2.58,1.06.19.06.37.11.55.16.87.21,1.76.34,2.65.35.04,0,.08.02.13.02.1,0,.19-.03.29-.04.83-.02,1.64-.13,2.45-.32.14-.03.28-.05.42-.09.87-.24,1.7-.59,2.5-1.03.08-.04.17-.06.25-.1l50.97-29.43c3.65-2.11,5.9-6.01,5.9-10.22v-58.86c0-4.22-2.25-8.11-5.9-10.22l-50.97-29.43c-3.65-2.11-8.15-2.11-11.81,0l-50.97,29.43c-.08.04-.13.11-.2.16-.78.48-1.51,1.02-2.15,1.66-.1.1-.18.21-.28.31-.57.6-1.08,1.26-1.51,1.97-.07.12-.15.22-.22.34-.44.77-.77,1.6-1.03,2.47-.05.19-.1.37-.14.56-.22.89-.37,1.81-.37,2.76v29.43c0,11.36-6.11,21.95-15.95,27.63-9.84,5.68-22.06,5.68-31.91,0l-25.49-14.71c-.82-.48-1.69-.8-2.57-1.06-.19-.06-.37-.11-.56-.16-.88-.21-1.76-.34-2.65-.34-.13,0-.26.02-.4.02-.84.02-1.66.13-2.47.32-.13.03-.27.05-.4.09-.87.24-1.71.6-2.51,1.04-.08.04-.16.06-.24.1l-50.97,29.43c-3.65,2.11-5.9,6.01-5.9,10.22v58.86c0,4.22,2.25,8.11,5.9,10.22l50.97,29.43c.08.04.17.06.24.1.8.44,1.64.79,2.5,1.03.14.04.28.06.42.09.81.19,1.62.3,2.45.32.1,0,.19.04.29.04.04,0,.08-.02.13-.02.89,0,1.77-.13,2.65-.35.19-.04.37-.1.56-.16.88-.26,1.75-.59,2.58-1.06l25.49-14.71c9.84-5.68,22.06-5.68,31.91,0,9.84,5.68,15.95,16.27,15.95,27.63v29.43c0,.95.15,1.87.37,2.76.05.19.09.37.14.56.25.86.59,1.69,1.03,2.47.07.12.15.22.22.34.43.71.94,1.37,1.51,1.97.1.1.18.21.28.31.65.63,1.37,1.18,2.15,1.66.07.04.13.11.2.16l50.97,29.43c1.83,1.05,3.86,1.58,5.9,1.58s4.08-.53,5.9-1.58l50.97-29.43c3.65-2.11,5.9-6.01,5.9-10.22v-58.86c0-4.22-2.25-8.11-5.9-10.22l-50.97-29.43c-.08-.04-.16-.06-.24-.1-.8-.44-1.64-.8-2.51-1.04-.13-.04-.26-.05-.39-.09-.82-.2-1.65-.31-2.49-.33-.13,0-.25-.02-.38-.02-.89,0-1.78.13-2.66.35-.18.04-.36.1-.54.15-.88.26-1.75.59-2.58,1.07l-25.49,14.72c-9.84,5.68-22.07,5.68-31.9,0-9.84-5.68-15.95-16.27-15.95-27.63s6.11-21.95,15.95-27.63Z"/>
+            <path fill="#3969ca" d="M141.09,317.65l50.97,29.43c1.83,1.05,3.86,1.58,5.9,1.58s4.08-.53,5.9-1.58l50.97-29.43c.08-.04.13-.11.2-.16.78-.48,1.51-1.02,2.15-1.66.1-.1.18-.21.28-.31.57-.6,1.08-1.26,1.51-1.97.07-.12.15-.22.22-.34.44-.77.77-1.6,1.03-2.47.05-.19.1-.37.14-.56.22-.89.37-1.81.37-2.76v-29.43c0-11.36,6.11-21.95,15.96-27.63s22.06-5.68,31.91,0l25.49,14.71c.82.48,1.69.8,2.57,1.06.19.06.37.11.56.16.87.21,1.76.34,2.64.35.04,0,.09.02.13.02.1,0,.19-.04.29-.04.83-.02,1.65-.13,2.45-.32.14-.03.28-.05.41-.09.87-.24,1.71-.6,2.51-1.04.08-.04.16-.06.24-.1l50.97-29.43c3.65-2.11,5.9-6.01,5.9-10.22v-58.86c0-4.22-2.25-8.11-5.9-10.22l-50.97-29.43c-3.65-2.11-8.15-2.11-11.81,0l-50.97,29.43c-.08.04-.13.11-.2.16-.78.48-1.51,1.02-2.15,1.66-.1.1-.18.21-.28.31-.57.6-1.08,1.26-1.51,1.97-.07.12-.15.22-.22.34-.44.77-.77,1.6-1.03,2.47-.05.19-.1.37-.14.56-.22.89-.37,1.81-.37,2.76v29.43c0,11.36-6.11,21.95-15.95,27.63-9.84,5.68-22.07,5.68-31.91,0l-25.49-14.71c-.82-.48-1.69-.8-2.58-1.06-.19-.06-.37-.11-.55-.16-.88-.21-1.76-.34-2.65-.35-.13,0-.26.02-.4.02-.83.02-1.66.13-2.47.32-.13.03-.27.05-.4.09-.87.24-1.71.6-2.51,1.04-.08.04-.16.06-.24.1l-50.97,29.43c-3.65,2.11-5.9,6.01-5.9,10.22v58.86c0,4.22,2.25,8.11,5.9,10.22Z"/>
+            <path fill="#0294de" d="M396.88,484.35l-50.97-29.43c-.08-.04-.17-.06-.24-.1-.8-.44-1.64-.79-2.51-1.03-.14-.04-.27-.06-.41-.09-.81-.19-1.64-.3-2.47-.32-.13,0-.26-.02-.39-.02-.89,0-1.78.13-2.66.35-.18.04-.36.1-.54.15-.88.26-1.76.59-2.58,1.07l-25.49,14.72c-9.84,5.68-22.06,5.68-31.9,0-9.84-5.68-15.96-16.27-15.96-27.63v-29.43c0-.95-.15-1.87-.37-2.76-.05-.19-.09-.37-.14-.56-.25-.86-.59-1.69-1.03-2.47-.07-.12-.15-.22-.22-.34-.43-.71-.94-1.37-1.51-1.97-.1-.1-.18-.21-.28-.31-.65-.63-1.37-1.18-2.15-1.66-.07-.04-.13-.11-.2-.16l-50.97-29.43c-3.65-2.11-8.15-2.11-11.81,0l-50.97,29.43c-3.65,2.11-5.9,6.01-5.9,10.22v58.86c0,4.22,2.25,8.11,5.9,10.22l50.97,29.43c.08.04.17.06.25.1.8.44,1.63.79,2.5,1.03.14.04.29.06.43.09.8.19,1.61.3,2.43.32.1,0,.2.04.3.04.04,0,.09-.02.13-.02.88,0,1.77-.13,2.64-.34.19-.04.37-.1.56-.16.88-.26,1.75-.59,2.57-1.06l25.49-14.71c9.84-5.68,22.06-5.68,31.91,0,9.84,5.68,15.95,16.27,15.95,27.63v29.43c0,.95.15,1.87.37,2.76.05.19.09.37.14.56.25.86.59,1.69,1.03,2.47.07.12.15.22.22.34.43.71.94,1.37,1.51,1.97.1.1.18.21.28.31.65.63,1.37,1.18,2.15,1.66.07.04.13.11.2.16l50.97,29.43c1.83,1.05,3.86,1.58,5.9,1.58s4.08-.53,5.9-1.58l50.97-29.43c3.65-2.11,5.9-6.01,5.9-10.22v-58.86c0-4.22-2.25-8.11-5.9-10.22Z"/>
+        </svg>`;
+
+        function getRepositoryName() {
+            const meta = $('meta[name="octolytics-dimension-repository_nwo"]');
+            if (meta?.content?.includes('/')) return meta.content;
+
+            const match = location.pathname.match(/^\/([^/]+)\/([^/]+)(?:\/|$)/);
+            if (!match || RESERVED.has(match[1].toLowerCase())) return null;
+            return `${match[1]}/${match[2]}`;
+        }
+
+        /*
+         * The About sidebar lists Readme / License / Activity / Stars /
+         * Watching / Forks as icon + label links, each in its own spacing
+         * wrapper. We anchor on the LAST of those present so our row lands at
+         * the bottom of that list (above "Report repository" when shown).
+         */
+        function findSidebarRow() {
+            const rows = $$(
+                'a[href$="/forks"], a[href$="/watchers"], a[href$="/stargazers"], ' +
+                'a[href$="/activity"], a[href="#readme-ov-file"], a[href*="/blob/"][href*="LICENSE" i]'
+            ).filter((a) => a.querySelector('svg.octicon') && a.closest('.BorderGrid-cell, .Layout-sidebar'));
+            const last = rows[rows.length - 1] || null;
+            return last ? { anchor: last, after: true } : null;
+        }
+
+        function findReportRow() {
+            const report = $('a[href^="/contact/report-content"]');
+            return report ? { anchor: report, after: false } : null; // sit above "Report repository"
+        }
+
+        const blockOf = (a) => (a.parentElement && a.parentElement.children.length === 1 ? a.parentElement : a);
+
+        function sync() {
+            const existing = document.getElementById(NODE_ID);
+            const target = findSidebarRow() || findReportRow();
+            const repo = target ? getRepositoryName() : null;
+
+            if (!target || !repo) {
+                existing?.remove();
+                return;
+            }
+
+            const url = `https://deepwiki.com/${repo}`;
+            const block = blockOf(target.anchor);
+            const neighbour = target.after ? 'previousElementSibling' : 'nextElementSibling';
+
+            if (existing && existing[neighbour] === block &&
+                (existing.matches('a') ? existing : $('a', existing))?.href === url) {
+                return;
+            }
+            existing?.remove();
+
+            // Clone the neighbouring row so wrapper spacing and link classes match.
+            const node = block.cloneNode(true);
+            node.id = NODE_ID;
+            $$('[id]', node).forEach((el) => el.removeAttribute('id'));
+
+            const link = node.matches('a') ? node : $('a', node);
+            if (!link) return;
+
+            for (const attr of [...link.attributes].map((a) => a.name)) {
+                if (attr.startsWith('data-') || attr.startsWith('aria-')) link.removeAttribute(attr);
+            }
+
+            link.href = url;
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            link.title = `Open ${repo} on DeepWiki`;
+            link.innerHTML = ICON;
+            link.append(document.createTextNode(LABEL));
+
+            block.insertAdjacentElement(target.after ? 'afterend' : 'beforebegin', node);
+        }
+
+        registerSync(sync);
+    })();
+
+    // ===============================================================
+    // MODULE 8 — Hide "Report repository" in the About sidebar.
+    // CSS-only: the link stays in the DOM (Module 7 can still use it as
+    // a positioning fallback) but neither it nor its spacing wrapper is
+    // rendered, so no empty gap is left behind.
+    // ===============================================================
+
+    (function moduleHideReport() {
+        addStyle(`
+            a[href^="/contact/report-content"] { display: none !important }
+            div:has(> a[href^="/contact/report-content"]:only-child) { display: none !important }`);
+    })();
+
+    // ===============================================================
     // Shared observer — GitHub is a soft-navigating SPA; one
     // frame-throttled observer runs every module's idempotent sync
     // ===============================================================
@@ -1827,6 +2162,8 @@
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
     document.addEventListener('turbo:load', runSyncs);
+    window.addEventListener('popstate', runSyncs);
 
+    flushStyles();
     runSyncs();
 })();
